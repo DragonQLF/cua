@@ -405,6 +405,7 @@ fn default_user_data_dir(product: BrowserProduct) -> Option<PathBuf> {
         BrowserProduct::GoogleChrome => "Library/Application Support/Google/Chrome",
         BrowserProduct::MicrosoftEdge => "Library/Application Support/Microsoft Edge",
         BrowserProduct::Chromium => "Library/Application Support/Chromium",
+        BrowserProduct::Brave => "Library/Application Support/BraveSoftware/Brave-Browser",
         _ => return None,
     };
     Some(home.join(relative))
@@ -1658,6 +1659,35 @@ mod tests {
             vec![("session-green".to_owned(), true)],
             "an active tab in another native window must not hide this window"
         );
+    }
+
+    #[test]
+    fn default_user_data_dir_covers_existing_profile_products() {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("HOME is set in tests"));
+        assert_eq!(
+            default_user_data_dir(BrowserProduct::Brave),
+            Some(home.join("Library/Application Support/BraveSoftware/Brave-Browser"))
+        );
+        assert_eq!(
+            default_user_data_dir(BrowserProduct::GoogleChrome),
+            Some(home.join("Library/Application Support/Google/Chrome"))
+        );
+        assert_eq!(
+            browser_product("Brave Browser", "com.brave.Browser"),
+            BrowserProduct::Brave
+        );
+        for product in [
+            BrowserProduct::GoogleChrome,
+            BrowserProduct::Chromium,
+            BrowserProduct::MicrosoftEdge,
+            BrowserProduct::Brave,
+        ] {
+            assert!(
+                existing_profile_setup_descriptor(product).is_some()
+                    == default_user_data_dir(product).is_some(),
+                "{product:?}: setup descriptor and profile root must be supported together"
+            );
+        }
     }
 
     #[test]

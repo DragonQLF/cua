@@ -116,6 +116,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y brave-browser
           brave-browser --version
+          echo "--- the brave-browser wrapper (does it exec the binary?)"
+          tail -n 6 /opt/brave.com/brave/brave-browser || true
+          ls -l /opt/brave.com/brave/brave
           payload="$(readlink -f "$(command -v brave-browser)")"
           echo "Brave resolves to $payload"
           # Same production trust contract as the Chrome lane: a root-owned

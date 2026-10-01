@@ -64,12 +64,27 @@ jobs:
           # installs for all users under Program Files. Chocolatey's package
           # installs per-user into LocalAppData, which the isolated-launch
           # trust check rightly refuses.
-          # the direct latest-release link: no API call, so no rate limit
-          $setup = Join-Path $env:RUNNER_TEMP 'BraveBrowserStandaloneSilentSetup.exe'
-          Invoke-WebRequest -Uri 'https://github.com/brave/brave-browser/releases/latest/download/BraveBrowserStandaloneSilentSetup.exe' -OutFile $setup
-          $installer = Get-AuthenticodeSignature -FilePath $setup
-          Write-Host "[brave] installer: $($installer.Status) $($installer.SignerCertificate.Subject)"
-          Start-Process -FilePath $setup -Verb RunAs -Wait
+          # The job is already elevated: run the installers directly (a
+          # RunAs relaunch can fail silently with nobody at the screen), the
+          # silent one first, then the standard one told to install for all
+          # users. Each attempt reports its exit code and where Brave landed.
+          $base = 'https://github.com/brave/brave-browser/releases/latest/download'
+          $attempts = @(
+            @{ File = 'BraveBrowserStandaloneSilentSetup.exe'; Args = @() },
+            @{ File = 'BraveBrowserStandaloneSetup.exe'; Args = @('/silent', '/install', 'appguid={AFE6A462-C574-4B8A-AF43-4CC60DF4563B}&appname=Brave-Browser&needsadmin=True') }
+          )
+          foreach ($attempt in $attempts) {
+            if (Test-Path -LiteralPath $brave) { break }
+            $setup = Join-Path $env:RUNNER_TEMP $attempt.File
+            Invoke-WebRequest -Uri "$base/$($attempt.File)" -OutFile $setup
+            $installer = Get-AuthenticodeSignature -FilePath $setup
+            Write-Host "[brave] $($attempt.File): $($installer.Status) $($installer.SignerCertificate.Subject)"
+            $process = Start-Process -FilePath $setup -ArgumentList $attempt.Args -PassThru -Wait
+            Write-Host "[brave] $($attempt.File) exited $($process.ExitCode)"
+            for ($i = 0; $i -lt 90 -and -not (Test-Path -LiteralPath $brave); $i++) { Start-Sleep -Seconds 2 }
+            Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Filter brave.exe ${env:ProgramFiles}, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA |
+              Select-Object -First 5 | ForEach-Object { Write-Host "[brave] found $($_.FullName)" }
+          }
           for ($i = 0; $i -lt 150 -and -not (Test-Path -LiteralPath $brave); $i++) { Start-Sleep -Seconds 2 }
           if (-not (Test-Path -LiteralPath $brave -PathType Leaf)) {
             Write-Host "[brave] brave.exe found at:"

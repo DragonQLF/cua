@@ -100,8 +100,9 @@ jobs:
           $signature = Get-AuthenticodeSignature -FilePath $brave
           if ($signature.Status -ne 'Valid') { throw "Brave signature is not valid: $($signature.Status)" }
           Write-Host "[browser-trust] verified vendor-signed Brave: $brave ($($signature.SignerCertificate.Subject))"
-          & $brave --version 2>$null
-          (Get-Item $brave).VersionInfo.ProductVersion
+          # brave.exe --version starts the browser on Windows; read the file's version
+          Write-Host "[brave] version $((Get-Item $brave).VersionInfo.ProductVersion)"
+          $global:LASTEXITCODE = 0
       - name: Install Linux desktop dependencies and Brave
         if: runner.os == 'Linux'
         shell: bash

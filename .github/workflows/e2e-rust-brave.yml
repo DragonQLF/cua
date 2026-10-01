@@ -3,8 +3,8 @@ name: "E2E: Rust standalone browsers (Brave)"
 # The standalone-browser suite for Brave on Windows and Linux X11: the same
 # steps as e2e-rust-standalone-browsers.yml, with Brave installed from its
 # vendor's own channels and CUA_E2E_BROWSER_PRODUCTS=brave. It validates
-# existing-profile attach (browser_prepare -> attached_existing_profile) on
-# the platforms the macOS-only run did not cover.
+# existing-profile attach (browser_prepare -> attached_existing_profile) and
+# isolated launch on the platforms the macOS-only run did not cover.
 
 on:
   push:
@@ -44,10 +44,6 @@ jobs:
       CUA_TEST_DRIVER_STDERR: "1"
       CUA_E2E_BROWSER_STDERR: "1"
       CUA_E2E_BROWSER_PRODUCTS: brave
-      # Isolated launch uses only system Chrome/Chromium (Linux) or Chrome/Edge
-      # (Windows); the Driver never launches Brave isolated, so that case does
-      # not apply to a Brave-only lane. Everything else runs.
-      CUA_E2E_EXCLUDE_TESTS: standalone_browser_prepare_isolated
       CUA_TEST_REQUIRE_PROTECTED_WINDOWS_BROWSER: ${{ matrix.label == 'Windows' && '1' || '0' }}
       CUA_E2E_EXPECT_ELEVATED_DRIVER: ${{ matrix.label == 'Windows' && '1' || '0' }}
       RUST_BACKTRACE: "1"
@@ -68,13 +64,11 @@ jobs:
           # installs for all users under Program Files. Chocolatey's package
           # installs per-user into LocalAppData, which the isolated-launch
           # trust check rightly refuses.
-          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/brave/brave-browser/releases/latest' -Headers @{ 'User-Agent' = 'cua-e2e' }
-          $asset = $release.assets | Where-Object { $_.name -eq 'BraveBrowserStandaloneSilentSetup.exe' } | Select-Object -First 1
-          if (-not $asset) { throw "no BraveBrowserStandaloneSilentSetup.exe in $($release.tag_name)" }
-          $setup = Join-Path $env:RUNNER_TEMP $asset.name
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $setup
+          # the direct latest-release link: no API call, so no rate limit
+          $setup = Join-Path $env:RUNNER_TEMP 'BraveBrowserStandaloneSilentSetup.exe'
+          Invoke-WebRequest -Uri 'https://github.com/brave/brave-browser/releases/latest/download/BraveBrowserStandaloneSilentSetup.exe' -OutFile $setup
           $installer = Get-AuthenticodeSignature -FilePath $setup
-          Write-Host "[brave] installer $($release.tag_name): $($installer.Status) $($installer.SignerCertificate.Subject)"
+          Write-Host "[brave] installer: $($installer.Status) $($installer.SignerCertificate.Subject)"
           Start-Process -FilePath $setup -Verb RunAs -Wait
           for ($i = 0; $i -lt 150 -and -not (Test-Path -LiteralPath $brave); $i++) { Start-Sleep -Seconds 2 }
           if (-not (Test-Path -LiteralPath $brave -PathType Leaf)) {
@@ -114,6 +108,16 @@ jobs:
           dir="$(dirname "$payload")"
           sudo chown root:root /opt "$(dirname "$dir")" "$dir" "$payload"
           sudo chmod go-w /opt "$(dirname "$dir")" "$dir" "$payload"
+      - name: Brave isolated-launch unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo test --release -p platform-windows --manifest-path libs/cua-driver/rust/Cargo.toml -- isolated_browser_candidates authenticode_identity
+          if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
+      - name: Brave isolated-launch unit tests (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo test --release -p platform-linux --manifest-path libs/cua-driver/rust/Cargo.toml -- isolated_browser_candidates
       - name: Build source driver on Windows
         if: runner.os == 'Windows'
         shell: pwsh

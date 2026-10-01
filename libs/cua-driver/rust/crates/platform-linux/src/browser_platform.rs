@@ -137,6 +137,7 @@ fn isolated_browser_candidates() -> Vec<PathBuf> {
         "/usr/lib/chromium/chromium",
         "/usr/lib/chromium-browser/chromium-browser",
         "/opt/microsoft/msedge/msedge",
+        "/opt/brave.com/brave/brave-browser",
     ]
     .into_iter()
     .map(PathBuf::from)
@@ -1431,6 +1432,7 @@ mod tests {
                 "/usr/lib/chromium/chromium",
                 "/usr/lib/chromium-browser/chromium-browser",
                 "/opt/microsoft/msedge/msedge",
+                "/opt/brave.com/brave/brave-browser",
             ]
             .map(PathBuf::from)
         );

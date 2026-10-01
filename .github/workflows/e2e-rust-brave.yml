@@ -44,6 +44,10 @@ jobs:
       CUA_TEST_DRIVER_STDERR: "1"
       CUA_E2E_BROWSER_STDERR: "1"
       CUA_E2E_BROWSER_PRODUCTS: brave
+      # Isolated launch uses only system Chrome/Chromium (Linux) or Chrome/Edge
+      # (Windows); the Driver never launches Brave isolated, so that case does
+      # not apply to a Brave-only lane. Everything else runs.
+      CUA_E2E_EXCLUDE_TESTS: standalone_browser_prepare_isolated
       CUA_TEST_REQUIRE_PROTECTED_WINDOWS_BROWSER: ${{ matrix.label == 'Windows' && '1' || '0' }}
       CUA_E2E_EXPECT_ELEVATED_DRIVER: ${{ matrix.label == 'Windows' && '1' || '0' }}
       RUST_BACKTRACE: "1"

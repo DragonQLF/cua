@@ -60,18 +60,21 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $brave = Join-Path ${env:ProgramFiles} 'BraveSoftware\Brave-Browser\Application\brave.exe'
-          choco install brave -y --no-progress
+          # Brave's own silent installer, run elevated (as hosted runners are),
+          # installs for all users under Program Files. Chocolatey's package
+          # installs per-user into LocalAppData, which the isolated-launch
+          # trust check rightly refuses.
+          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/brave/brave-browser/releases/latest' -Headers @{ 'User-Agent' = 'cua-e2e' }
+          $asset = $release.assets | Where-Object { $_.name -eq 'BraveBrowserStandaloneSilentSetup.exe' } | Select-Object -First 1
+          if (-not $asset) { throw "no BraveBrowserStandaloneSilentSetup.exe in $($release.tag_name)" }
+          $setup = Join-Path $env:RUNNER_TEMP $asset.name
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $setup
+          $installer = Get-AuthenticodeSignature -FilePath $setup
+          Write-Host "[brave] installer $($release.tag_name): $($installer.Status) $($installer.SignerCertificate.Subject)"
+          Start-Process -FilePath $setup -Verb RunAs -Wait
+          for ($i = 0; $i -lt 150 -and -not (Test-Path -LiteralPath $brave); $i++) { Start-Sleep -Seconds 2 }
           if (-not (Test-Path -LiteralPath $brave -PathType Leaf)) {
-            # Brave's own system-level installer, from its release page
-            $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/brave/brave-browser/releases/latest' -Headers @{ 'User-Agent' = 'cua-e2e' }
-            $asset = $release.assets | Where-Object { $_.name -eq 'BraveBrowserStandaloneSilentSetup.exe' } | Select-Object -First 1
-            if (-not $asset) { throw "no BraveBrowserStandaloneSilentSetup.exe in $($release.tag_name)" }
-            $setup = Join-Path $env:RUNNER_TEMP $asset.name
-            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $setup
-            & $setup --system-level --do-not-launch-chrome
-            for ($i = 0; $i -lt 120 -and -not (Test-Path -LiteralPath $brave); $i++) { Start-Sleep -Seconds 2 }
-          }
-          if (-not (Test-Path -LiteralPath $brave -PathType Leaf)) {
+            Write-Host "[brave] brave.exe found at:"
             Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Filter brave.exe ${env:ProgramFiles}, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA | Select-Object -First 5 FullName
             throw "Brave is not installed system-wide at $brave"
           }

@@ -56,6 +56,7 @@ jobs:
         run: .\scripts\ci\windows\setup-ffmpeg.ps1
       - name: Install Brave (Windows, system-level)
         if: runner.os == 'Windows'
+        timeout-minutes: 20
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -79,8 +80,11 @@ jobs:
             Invoke-WebRequest -Uri "$base/$($attempt.File)" -OutFile $setup
             $installer = Get-AuthenticodeSignature -FilePath $setup
             Write-Host "[brave] $($attempt.File): $($installer.Status) $($installer.SignerCertificate.Subject)"
-            $process = Start-Process -FilePath $setup -ArgumentList $attempt.Args -PassThru -Wait
-            Write-Host "[brave] $($attempt.File) exited $($process.ExitCode)"
+            # Wait for the installer alone: Start-Process -Wait also waits for
+            # everything it starts, and the installer opens Brave when done.
+            $process = Start-Process -FilePath $setup -ArgumentList $attempt.Args -PassThru
+            if (-not $process.WaitForExit(600000)) { Write-Host "[brave] $($attempt.File) still running after 10 minutes" }
+            else { Write-Host "[brave] $($attempt.File) exited $($process.ExitCode)" }
             for ($i = 0; $i -lt 90 -and -not (Test-Path -LiteralPath $brave); $i++) { Start-Sleep -Seconds 2 }
             Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Filter brave.exe ${env:ProgramFiles}, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA |
               Select-Object -First 5 | ForEach-Object { Write-Host "[brave] found $($_.FullName)" }
@@ -91,6 +95,8 @@ jobs:
             Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Filter brave.exe ${env:ProgramFiles}, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA | Select-Object -First 5 FullName
             throw "Brave is not installed system-wide at $brave"
           }
+          # a browser the installer opened would hold the profile the suite needs
+          Get-Process brave -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $signature = Get-AuthenticodeSignature -FilePath $brave
           if ($signature.Status -ne 'Valid') { throw "Brave signature is not valid: $($signature.Status)" }
           Write-Host "[browser-trust] verified vendor-signed Brave: $brave ($($signature.SignerCertificate.Subject))"

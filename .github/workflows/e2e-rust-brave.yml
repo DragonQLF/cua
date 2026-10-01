@@ -65,29 +65,29 @@ jobs:
           # installs for all users under Program Files. Chocolatey's package
           # installs per-user into LocalAppData, which the isolated-launch
           # trust check rightly refuses.
-          # The job is already elevated: run the installers directly (a
-          # RunAs relaunch can fail silently with nobody at the screen), the
-          # silent one first, then the standard one told to install for all
-          # users. Each attempt reports its exit code and where Brave landed.
-          $base = 'https://github.com/brave/brave-browser/releases/latest/download'
-          $attempts = @(
-            @{ File = 'BraveBrowserStandaloneSilentSetup.exe'; Args = @() },
-            @{ File = 'BraveBrowserStandaloneSetup.exe'; Args = @('/silent', '/install', 'appguid={AFE6A462-C574-4B8A-AF43-4CC60DF4563B}&appname=Brave-Browser&needsadmin=True') }
-          )
-          foreach ($attempt in $attempts) {
-            if (Test-Path -LiteralPath $brave) { break }
-            $setup = Join-Path $env:RUNNER_TEMP $attempt.File
-            Invoke-WebRequest -Uri "$base/$($attempt.File)" -OutFile $setup
-            $installer = Get-AuthenticodeSignature -FilePath $setup
-            Write-Host "[brave] $($attempt.File): $($installer.Status) $($installer.SignerCertificate.Subject)"
-            # Wait for the installer alone: Start-Process -Wait also waits for
-            # everything it starts, and the installer opens Brave when done.
-            $process = Start-Process -FilePath $setup -ArgumentList $attempt.Args -PassThru
-            if (-not $process.WaitForExit(600000)) { Write-Host "[brave] $($attempt.File) still running after 10 minutes" }
-            else { Write-Host "[brave] $($attempt.File) exited $($process.ExitCode)" }
-            for ($i = 0; $i -lt 90 -and -not (Test-Path -LiteralPath $brave); $i++) { Start-Sleep -Seconds 2 }
-            Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Filter brave.exe ${env:ProgramFiles}, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA |
-              Select-Object -First 5 | ForEach-Object { Write-Host "[brave] found $($_.FullName)" }
+          # Brave's own silent installer installs per-user (LocalAppData) even
+          # elevated, and its standard installer waits on a prompt nobody sees.
+          # Isolated launch accepts only a vendor-signed tree under Program
+          # Files that a standard user cannot write, so the signed Application
+          # folder is copied there; Authenticode signatures are in the files.
+          # Existing-profile attach uses the per-user install as it is.
+          $setup = Join-Path $env:RUNNER_TEMP 'BraveBrowserStandaloneSilentSetup.exe'
+          Invoke-WebRequest -Uri 'https://github.com/brave/brave-browser/releases/latest/download/BraveBrowserStandaloneSilentSetup.exe' -OutFile $setup
+          $installer = Get-AuthenticodeSignature -FilePath $setup
+          Write-Host "[brave] installer: $($installer.Status) $($installer.SignerCertificate.Subject)"
+          $process = Start-Process -FilePath $setup -PassThru
+          if (-not $process.WaitForExit(600000)) { throw "Brave's installer still running after 10 minutes" }
+          Write-Host "[brave] installer exited $($process.ExitCode)"
+          $perUser = Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\Application'
+          for ($i = 0; $i -lt 90 -and -not (Test-Path -LiteralPath (Join-Path $perUser 'brave.exe')); $i++) { Start-Sleep -Seconds 2 }
+          Get-Process brave -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          if (-not (Test-Path -LiteralPath $brave)) {
+            $system = Split-Path -Parent $brave
+            New-Item -ItemType Directory -Force -Path $system | Out-Null
+            robocopy $perUser $system /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "copying Brave into Program Files failed ($LASTEXITCODE)" }
+            Write-Host "[brave] copied the signed Application folder to $system"
           }
           for ($i = 0; $i -lt 150 -and -not (Test-Path -LiteralPath $brave); $i++) { Start-Sleep -Seconds 2 }
           if (-not (Test-Path -LiteralPath $brave -PathType Leaf)) {

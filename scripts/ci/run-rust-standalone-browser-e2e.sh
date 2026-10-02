@@ -144,6 +144,19 @@ else
     tests+=(standalone_browser_native_omnibox_select_all)
   fi
 fi
+# A lane may leave out cases that do not apply to its products, by name
+# (comma-separated), e.g. isolated launch for a product the Driver never
+# launches isolated.
+if [[ -n "${CUA_E2E_EXCLUDE_TESTS:-}" ]]; then
+  IFS=',' read -r -a excluded <<<"${CUA_E2E_EXCLUDE_TESTS}"
+  kept=()
+  for test_name in "${tests[@]}"; do
+    skip=0
+    for name in "${excluded[@]}"; do [[ "${test_name}" == "${name// /}" ]] && skip=1; done
+    if [[ "${skip}" == 1 ]]; then echo "[EXCLUDED] ${test_name}"; else kept+=("${test_name}"); fi
+  done
+  tests=("${kept[@]}")
+fi
 failure_count=0
 for test_name in "${tests[@]}"; do
   echo "[RUN] ${test_name}"

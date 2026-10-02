@@ -1,0 +1,214 @@
+name: "E2E: Rust standalone browsers (Brave)"
+
+# The standalone-browser suite for Brave on Windows and Linux X11: the same
+# steps as e2e-rust-standalone-browsers.yml, with Brave installed from its
+# vendor's own channels and CUA_E2E_BROWSER_PRODUCTS=brave. It validates
+# existing-profile attach (browser_prepare -> attached_existing_profile) and
+# isolated launch on the platforms the macOS-only run did not cover.
+
+on:
+  push:
+    branches: [brave-e2e, brave-evidence]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CUA_TELEMETRY: "0"
+  DO_NOT_TRACK: "1"
+
+concurrency:
+  group: e2e-rust-brave-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  browser:
+    name: "${{ matrix.label }} / brave"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows
+            os: windows-latest
+            artifact: rust-browser-windows-brave
+          - label: Linux X11
+            os: ubuntu-latest
+            artifact: rust-browser-linux-x11-brave
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    env:
+      CUA_E2E_SOURCE_SHA: ${{ github.sha }}
+      CUA_TEST_REQUIRE_EXTERNAL_BROWSERS: "1"
+      CUA_E2E_FORBID_SKIPS: "1"
+      CUA_TEST_DRIVER_STDERR: "1"
+      CUA_E2E_BROWSER_STDERR: "1"
+      CUA_E2E_BROWSER_PRODUCTS: brave
+      CUA_TEST_REQUIRE_PROTECTED_WINDOWS_BROWSER: ${{ matrix.label == 'Windows' && '1' || '0' }}
+      CUA_E2E_EXPECT_ELEVATED_DRIVER: ${{ matrix.label == 'Windows' && '1' || '0' }}
+      RUST_BACKTRACE: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - name: Install Windows video tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\ci\windows\setup-ffmpeg.ps1
+      - name: Install Brave (Windows, system-level)
+        if: runner.os == 'Windows'
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $brave = Join-Path ${env:ProgramFiles} 'BraveSoftware\Brave-Browser\Application\brave.exe'
+          # Brave's own silent installer, run elevated (as hosted runners are),
+          # installs for all users under Program Files. Chocolatey's package
+          # installs per-user into LocalAppData, which the isolated-launch
+          # trust check rightly refuses.
+          # Brave's own silent installer installs per-user (LocalAppData) even
+          # elevated, and its standard installer waits on a prompt nobody sees.
+          # Isolated launch accepts only a vendor-signed tree under Program
+          # Files that a standard user cannot write, so the signed Application
+          # folder is copied there; Authenticode signatures are in the files.
+          # Existing-profile attach uses the per-user install as it is.
+          $setup = Join-Path $env:RUNNER_TEMP 'BraveBrowserStandaloneSilentSetup.exe'
+          Invoke-WebRequest -Uri 'https://github.com/brave/brave-browser/releases/latest/download/BraveBrowserStandaloneSilentSetup.exe' -OutFile $setup
+          $installer = Get-AuthenticodeSignature -FilePath $setup
+          Write-Host "[brave] installer: $($installer.Status) $($installer.SignerCertificate.Subject)"
+          $process = Start-Process -FilePath $setup -PassThru
+          if (-not $process.WaitForExit(600000)) { throw "Brave's installer still running after 10 minutes" }
+          Write-Host "[brave] installer exited $($process.ExitCode)"
+          $perUser = Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\Application'
+          for ($i = 0; $i -lt 90 -and -not (Test-Path -LiteralPath (Join-Path $perUser 'brave.exe')); $i++) { Start-Sleep -Seconds 2 }
+          Get-Process brave -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          if (-not (Test-Path -LiteralPath $brave)) {
+            $system = Split-Path -Parent $brave
+            New-Item -ItemType Directory -Force -Path $system | Out-Null
+            robocopy $perUser $system /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "copying Brave into Program Files failed ($LASTEXITCODE)" }
+            Write-Host "[brave] copied the signed Application folder to $system"
+          }
+          for ($i = 0; $i -lt 150 -and -not (Test-Path -LiteralPath $brave); $i++) { Start-Sleep -Seconds 2 }
+          if (-not (Test-Path -LiteralPath $brave -PathType Leaf)) {
+            Write-Host "[brave] brave.exe found at:"
+            Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Filter brave.exe ${env:ProgramFiles}, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA | Select-Object -First 5 FullName
+            throw "Brave is not installed system-wide at $brave"
+          }
+          # a browser the installer opened would hold the profile the suite needs
+          Get-Process brave -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $signature = Get-AuthenticodeSignature -FilePath $brave
+          if ($signature.Status -ne 'Valid') { throw "Brave signature is not valid: $($signature.Status)" }
+          Write-Host "[browser-trust] verified vendor-signed Brave: $brave ($($signature.SignerCertificate.Subject))"
+          foreach ($exe in @($brave, (Join-Path $perUser 'brave.exe'))) {
+            $sig = Get-AuthenticodeSignature -FilePath $exe
+            Write-Host "[brave-evidence] authenticode $exe"
+            Write-Host "[brave-evidence]   status: $($sig.Status)"
+            Write-Host "[brave-evidence]   subject: $($sig.SignerCertificate.Subject)"
+            Write-Host "[brave-evidence]   issuer: $($sig.SignerCertificate.Issuer)"
+            Write-Host "[brave-evidence]   thumbprint: $($sig.SignerCertificate.Thumbprint)"
+          }
+          Write-Host "[brave-evidence] os: $((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version)"
+          # brave.exe --version starts the browser on Windows; read the file's version
+          Write-Host "[brave] version $((Get-Item $brave).VersionInfo.ProductVersion)"
+          $global:LASTEXITCODE = 0
+      - name: Install Linux desktop dependencies and Brave
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl \
+            xvfb dbus-x11 at-spi2-core openbox picom libgtk-3-dev clang pkg-config \
+            libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev libei-dev \
+            libx11-dev libxi-dev libxtst-dev libxext-dev libssl-dev \
+            libxdo-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev ffmpeg
+          # Brave's own apt repository
+          sudo curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg \
+            https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/brave-browser-release.list
+          sudo apt-get update
+          sudo apt-get install -y brave-browser
+          brave-browser --version
+          echo "--- the brave-browser wrapper (does it exec the binary?)"
+          tail -n 6 /opt/brave.com/brave/brave-browser || true
+          ls -l /opt/brave.com/brave/brave
+          echo "[brave-evidence] as installed by the package, before this job changes anything:"
+          dpkg -S /opt/brave.com/brave/brave | sed 's/^/[brave-evidence] /'
+          dpkg-query -W -f='[brave-evidence] package ${Package} ${Version} (${Maintainer})\n' brave-browser
+          apt-cache policy brave-browser | sed 's/^/[brave-evidence] /'
+          stat -c '[brave-evidence] %U:%G %a %n' /opt /opt/brave.com /opt/brave.com/brave /opt/brave.com/brave/brave
+          echo "[brave-evidence] os: $(. /etc/os-release; echo "$PRETTY_NAME") $(uname -r)"
+          payload="$(readlink -f "$(command -v brave-browser)")"
+          echo "Brave resolves to $payload"
+          # Same production trust contract as the Chrome lane: a root-owned
+          # installation whose whole path is not group- or world-writable.
+          dir="$(dirname "$payload")"
+          sudo chown root:root /opt "$(dirname "$dir")" "$dir" "$payload"
+          sudo chmod go-w /opt "$(dirname "$dir")" "$dir" "$payload"
+      - name: Brave isolated-launch unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo test --release -p platform-windows --manifest-path libs/cua-driver/rust/Cargo.toml -- isolated_browser_candidates authenticode_identity
+          if ($LASTEXITCODE -ne 0) { throw "unit tests failed" }
+      - name: Brave isolated-launch unit tests (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo test --release -p platform-linux --manifest-path libs/cua-driver/rust/Cargo.toml -- isolated_browser_candidates
+      - name: Build source driver on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release -p cua-driver --manifest-path libs/cua-driver/rust/Cargo.toml
+          Write-Host "[brave-evidence] driver: $(& libs/cua-driver/rust/target/release/cua-driver.exe --version) at $env:GITHUB_SHA"
+      - name: Run standalone browsers on Windows from an elevated Driver
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactDir = Join-Path $PWD 'artifacts\cua-driver\standalone-browser'
+          $scriptPath = Join-Path $PWD 'scripts\ci\windows\run-rust-standalone-browser-e2e.ps1'
+          # The elevated Driver launches isolated browsers with a derived
+          # standard-user token; the suite verifies that token independently.
+          $env:CUA_E2E_ARTIFACT_DIR = $artifactDir
+          & $scriptPath -NoBuild
+          if ($LASTEXITCODE -ne 0) { throw "standalone-browser E2E failed with exit code $LASTEXITCODE" }
+      - name: Build source driver on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo build --release -p cua-driver --features portal-input --manifest-path libs/cua-driver/rust/Cargo.toml
+          echo "[brave-evidence] driver: $(libs/cua-driver/rust/target/release/cua-driver --version) at $GITHUB_SHA"
+      - name: Run standalone browsers on Linux X11
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export CUA_E2E_ARTIFACT_DIR="$PWD/artifacts/cua-driver/standalone-browser"
+          export CUA_E2E_SKIP_BUILD=1
+          # Hosted Linux does not provide a browser sandbox suitable for the
+          # isolated test profiles. This affects only disposable test browsers.
+          export CUA_E2E_BROWSER_NO_SANDBOX=1
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            dbus-run-session -- bash -lc \
+            'openbox >/tmp/cua-browser-openbox.log 2>&1 & picom --backend xrender --config /dev/null >/tmp/cua-browser-picom.log 2>&1 & sleep 2; exec scripts/ci/run-rust-standalone-browser-e2e.sh'
+      - name: Publish job summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f artifacts/cua-driver/standalone-browser/summary.md ]]; then
+            cat artifacts/cua-driver/standalone-browser/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Standalone browser summary was not produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifacts/cua-driver/standalone-browser
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

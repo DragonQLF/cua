@@ -139,6 +139,14 @@ $tests = @(
     "standalone_browser_upload",
     "standalone_browser_window_collision"
 )
+# A lane may leave out cases that do not apply to its products, by name
+# (comma-separated), e.g. isolated launch for a product the Driver never
+# launches isolated.
+if ($env:CUA_E2E_EXCLUDE_TESTS) {
+    $excluded = $env:CUA_E2E_EXCLUDE_TESTS.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    foreach ($name in $tests | Where-Object { $excluded -contains $_ }) { Write-Host "[EXCLUDED] $name" }
+    $tests = @($tests | Where-Object { $excluded -notcontains $_ })
+}
 $failureCount = 0
 foreach ($testName in $tests) {
     $testExit = Invoke-CargoStep -Name $testName -Arguments @(

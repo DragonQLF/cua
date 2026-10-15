@@ -6,6 +6,7 @@
 //! `{"status": "ok" | "refused", ...}`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -17,6 +18,7 @@ use crate::tool_args::ArgsExt;
 use super::cdp_ws::CdpConnection;
 use super::download::BrowserDownloadTool;
 use super::engine::{BrowserEngine, BrowserTabScreenshot};
+use super::file_chooser::{deliver_with_chooser_contained, ChooserInterception, CHOOSER_WAIT};
 use super::platform::{BrowserVisualActionKind, PrepareProfile, PrepareRequest, PrepareStrategy};
 use super::pointer::BrowserPointerTool;
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
@@ -1198,138 +1200,144 @@ impl Tool for BrowserClickTool {
         }
 
         // Trusted route: resolve a click point, then Input.dispatchMouseEvent.
-        let (x, y) = match (backend_node_id, coords) {
-            (Some(backend), _) => {
-                // Best effort scroll-into-view; ignore failure (older Chromium).
-                let _ = conn
-                    .call(
-                        Some(cdp),
-                        "DOM.scrollIntoViewIfNeeded",
-                        json!({ "backendNodeId": backend }),
-                    )
-                    .await;
-                let box_model = match conn
-                    .call(
-                        Some(cdp),
-                        "DOM.getBoxModel",
-                        json!({ "backendNodeId": backend }),
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return BrowserRefusal::new(
-                            BrowserRefusalCode::BrowserRefStale,
-                            "the ref's node has no layout box — it left the DOM or is hidden",
+        // A trusted click carries user activation, so the page could open a
+        // native file picker: contain it for the whole delivery.
+        let delivery = async {
+            let (x, y) = match (backend_node_id, coords) {
+                (Some(backend), _) => {
+                    // Best effort scroll-into-view; ignore failure (older Chromium).
+                    let _ = conn
+                        .call(
+                            Some(cdp),
+                            "DOM.scrollIntoViewIfNeeded",
+                            json!({ "backendNodeId": backend }),
                         )
-                        .to_tool_result()
-                    }
-                };
-                match quad_center(&box_model) {
-                    Some(pt) => pt,
-                    None => {
-                        return BrowserRefusal::new(
-                            BrowserRefusalCode::BrowserRefStale,
-                            "the ref's node returned an unusable layout box",
-                        )
-                        .to_tool_result()
+                        .await;
+                    let box_model =
+                        match conn
+                            .call(
+                                Some(cdp),
+                                "DOM.getBoxModel",
+                                json!({ "backendNodeId": backend }),
+                            )
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(_) => return BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserRefStale,
+                                "the ref's node has no layout box — it left the DOM or is hidden",
+                            )
+                            .to_tool_result(),
+                        };
+                    match quad_center(&box_model) {
+                        Some(pt) => pt,
+                        None => {
+                            return BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserRefStale,
+                                "the ref's node returned an unusable layout box",
+                            )
+                            .to_tool_result()
+                        }
                     }
                 }
-            }
-            (None, Some(pt)) => pt,
-            (None, None) => unreachable!("validated above"),
-        };
+                (None, Some(pt)) => pt,
+                (None, None) => unreachable!("validated above"),
+            };
 
-        self.engine
-            .visualize_browser_action(
-                &session,
-                &validated,
-                cdp,
-                x,
-                y,
-                BrowserVisualActionKind::Click,
-            )
-            .await;
+            self.engine
+                .visualize_browser_action(
+                    &session,
+                    &validated,
+                    cdp,
+                    x,
+                    y,
+                    BrowserVisualActionKind::Click,
+                )
+                .await;
 
-        if let Err(error) = conn
-            .call(
-                Some(cdp),
-                "Emulation.setFocusEmulationEnabled",
-                json!({ "enabled": true }),
-            )
-            .await
-        {
-            return BrowserRefusal::new(
-                BrowserRefusalCode::BrowserInputTrustUnavailable,
-                format!(
-                    "the target tab could not enter CDP focus emulation for trusted input: {error}"
-                ),
-            )
-            .to_tool_result();
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-
-        let mut delivery_error = None;
-        for (event_type, click_count) in [("mousePressed", 1), ("mouseReleased", 1)] {
             if let Err(error) = conn
                 .call(
                     Some(cdp),
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": event_type,
-                        "x": x,
-                        "y": y,
-                        "button": "left",
-                        "clickCount": click_count,
-                    }),
+                    "Emulation.setFocusEmulationEnabled",
+                    json!({ "enabled": true }),
                 )
                 .await
             {
-                delivery_error = Some(error);
-                break;
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserInputTrustUnavailable,
+                    format!(
+                        "the target tab could not enter CDP focus emulation for trusted input: {error}"
+                    ),
+                )
+                .to_tool_result();
             }
-        }
-        let cleanup_error = conn
-            .call(
-                Some(cdp),
-                "Emulation.setFocusEmulationEnabled",
-                json!({ "enabled": false }),
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+            let mut delivery_error = None;
+            for (event_type, click_count) in [("mousePressed", 1), ("mouseReleased", 1)] {
+                if let Err(error) = conn
+                    .call(
+                        Some(cdp),
+                        "Input.dispatchMouseEvent",
+                        json!({
+                            "type": event_type,
+                            "x": x,
+                            "y": y,
+                            "button": "left",
+                            "clickCount": click_count,
+                        }),
+                    )
+                    .await
+                {
+                    delivery_error = Some(error);
+                    break;
+                }
+            }
+            let cleanup_error = conn
+                .call(
+                    Some(cdp),
+                    "Emulation.setFocusEmulationEnabled",
+                    json!({ "enabled": false }),
+                )
+                .await
+                .err();
+            if let Some(error) = delivery_error {
+                // Trusted input is the contract; we never silently fall back to
+                // synthetic events. Focus emulation has already been unwound.
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserInputTrustUnavailable,
+                    format!(
+                        "trusted Input route failed ({error}) — re-run with \
+                         input_route=\"dom_event\" to explicitly request a synthetic click"
+                    ),
+                )
+                .to_tool_result();
+            }
+            if let Some(error) = cleanup_error {
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserInputTrustUnavailable,
+                    format!(
+                        "trusted click was acknowledged but CDP focus emulation could not be restored ({error}); delivery is unknown and must not be retried automatically"
+                    ),
+                )
+                .with_detail(json!({ "delivery": "unknown", "retryable": false }))
+                .to_tool_result();
+            }
+            ToolResult::text(format!("clicked ({x:.0}, {y:.0}) in {tab_id}")).with_structured(
+                json!({
+                    "status": "ok",
+                    "route": "trusted",
+                    "delivery_mode": if foreground { "foreground" } else { "background" },
+                    "target_id": target_id,
+                    "tab_id": tab_id,
+                    "ref": ext_ref,
+                    "frame": frame_kind,
+                    "x": x,
+                    "y": y,
+                }),
             )
-            .await
-            .err();
-        if let Some(error) = delivery_error {
-            // Trusted input is the contract; we never silently fall back to
-            // synthetic events. Focus emulation has already been unwound.
-            return BrowserRefusal::new(
-                BrowserRefusalCode::BrowserInputTrustUnavailable,
-                format!(
-                    "trusted Input route failed ({error}) — re-run with \
-                     input_route=\"dom_event\" to explicitly request a synthetic click"
-                ),
-            )
-            .to_tool_result();
-        }
-        if let Some(error) = cleanup_error {
-            return BrowserRefusal::new(
-                BrowserRefusalCode::BrowserInputTrustUnavailable,
-                format!(
-                    "trusted click was acknowledged but CDP focus emulation could not be restored ({error}); delivery is unknown and must not be retried automatically"
-                ),
-            )
-            .with_detail(json!({ "delivery": "unknown", "retryable": false }))
-            .to_tool_result();
-        }
-        ToolResult::text(format!("clicked ({x:.0}, {y:.0}) in {tab_id}")).with_structured(json!({
-            "status": "ok",
-            "route": "trusted",
-            "delivery_mode": if foreground { "foreground" } else { "background" },
-            "target_id": target_id,
-            "tab_id": tab_id,
-            "ref": ext_ref,
-            "frame": frame_kind,
-            "x": x,
-            "y": y,
-        }))
+        };
+        deliver_with_chooser_contained(&self.engine, &validated, ext_ref.as_deref(), delivery).await
     }
 }
 
@@ -2318,17 +2326,20 @@ impl BrowserSetInputFilesTool {
         Self {
             def: ToolDef {
                 name: "browser_set_input_files".into(),
-                description: "Assign one or more explicit absolute local files to an exact live <input type=file> ref through CDP. This bypasses native file pickers, rejects symlinks and non-regular files, and never returns local paths.".into(),
+                description: "Upload one or more explicit absolute local files through an exact live ref, the way DevTools does: no native file picker ever opens. The ref may be the <input type=file> itself, or a label, button, or drop zone for it. A field the ref is, labels, contains, or controls is filled directly; otherwise the ref is activated with the file chooser intercepted and the chooser the page opens is filled; a ref that opens no chooser gets the files dropped on it as a drag would. Several files need a field or chooser that accepts several. Rejects symlinks and non-regular files and never returns local paths.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "target_id": schema_target_id(),
                         "tab_id": schema_tab_id(),
                         "session": schema_session(),
-                        "ref": schema_ref(),
+                        "ref": {
+                            "type": "string",
+                            "description": "Ref of the file input, or of the label, button, or drop zone for it, from get_browser_state. Refs are invalidated by navigation and by newer snapshots of the same tab."
+                        },
                         "files": {
                             "type": "array", "minItems": 1, "maxItems": 32,
-                            "description": "Absolute paths of 1 to 32 local regular files to assign to the input.",
+                            "description": "Absolute paths of 1 to 32 local regular files to upload.",
                             "items": { "type": "string", "description": "Absolute path to one local regular file." }
                         }
                     },
@@ -2345,7 +2356,7 @@ impl BrowserSetInputFilesTool {
     }
 }
 
-fn validated_upload_paths(args: &Value) -> Result<Vec<String>, ToolResult> {
+pub(crate) fn validated_upload_paths(args: &Value) -> Result<Vec<String>, ToolResult> {
     let Some(files) = args.get("files").and_then(Value::as_array) else {
         return Err(ToolResult::error(
             "files must be a non-empty array of absolute paths",
@@ -2378,6 +2389,144 @@ fn validated_upload_paths(args: &Value) -> Result<Vec<String>, ToolResult> {
                 .map_err(|_| ToolResult::error("an upload path could not be canonicalized"))
         })
         .collect()
+}
+
+/// Evaluated on the ref's own node. Returns the one `<input type=file>` the
+/// ref is, labels, contains, sits in a label for, or controls; with
+/// `nearby`, also the single file input in its closest enclosing section
+/// below `<body>`. Several candidates are ambiguous and return `null`.
+const RELATED_FILE_INPUT: &str = "function(nearby) { \
+    const isFile = (n) => !!n && n.localName === 'input' && (n.type || '').toLowerCase() === 'file'; \
+    const deep = (root, out, depth) => { \
+        if (depth > 6 || out.length > 1) return out; \
+        for (const n of root.querySelectorAll('*')) { \
+            if (isFile(n)) out.push(n); \
+            if (n.shadowRoot) deep(n.shadowRoot, out, depth + 1); \
+            if (out.length > 1) break; \
+        } \
+        return out; \
+    }; \
+    if (isFile(this)) return this; \
+    if (this.localName === 'label' && isFile(this.control)) return this.control; \
+    const inside = deep(this, [], 0); \
+    if (inside.length === 1) return inside[0]; \
+    const label = this.closest ? this.closest('label') : null; \
+    if (label && isFile(label.control)) return label.control; \
+    const root = this.getRootNode(); \
+    const byId = (id) => id ? (root.getElementById ? root.getElementById(id) : this.ownerDocument.getElementById(id)) : null; \
+    const controlled = ((this.getAttribute && this.getAttribute('aria-controls')) || '').split(/\\s+/).map(byId).find(isFile); \
+    if (controlled) return controlled; \
+    if (!nearby) return null; \
+    let scope = this; \
+    for (let level = 0; level < 6; level++) { \
+        scope = scope.parentElement || (scope.getRootNode && scope.getRootNode().host) || null; \
+        if (!scope || scope === this.ownerDocument.documentElement || scope === this.ownerDocument.body) break; \
+        const found = deep(scope, [], 0); \
+        if (found.length === 1) return found[0]; \
+        if (found.length > 1) return null; \
+    } \
+    return null; \
+}";
+
+/// A file input proven through `DOM.describeNode`.
+struct FileField {
+    backend_node_id: i64,
+    multiple: bool,
+}
+
+fn attribute<'a>(node: &'a Value, name: &str) -> Option<&'a str> {
+    node["attributes"]
+        .as_array()?
+        .chunks_exact(2)
+        .find(|pair| {
+            pair[0]
+                .as_str()
+                .is_some_and(|attr| attr.eq_ignore_ascii_case(name))
+        })
+        .and_then(|pair| pair[1].as_str())
+}
+
+fn file_field_of(node: &Value) -> Option<FileField> {
+    let is_input = node["nodeName"]
+        .as_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case("input"));
+    let is_file = attribute(node, "type").is_some_and(|value| value.eq_ignore_ascii_case("file"));
+    if !is_input || !is_file {
+        return None;
+    }
+    Some(FileField {
+        backend_node_id: node["backendNodeId"].as_i64()?,
+        multiple: attribute(node, "multiple").is_some(),
+    })
+}
+
+/// The file input related to the ref's object, proven by the browser.
+async fn related_file_field(
+    conn: &CdpConnection,
+    cdp: &str,
+    object_id: &str,
+    nearby: bool,
+) -> Option<FileField> {
+    let found = conn
+        .call(
+            Some(cdp),
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": RELATED_FILE_INPUT,
+                "arguments": [{ "value": nearby }],
+                "returnByValue": false,
+            }),
+        )
+        .await
+        .ok()?;
+    if found.get("exceptionDetails").is_some() {
+        return None;
+    }
+    let field_object = found["result"]["objectId"].as_str()?;
+    if found["result"]["subtype"].as_str() != Some("node") {
+        return None;
+    }
+    let described = conn
+        .call(
+            Some(cdp),
+            "DOM.describeNode",
+            json!({ "objectId": field_object }),
+        )
+        .await
+        .ok()?;
+    file_field_of(&described["node"])
+}
+
+fn too_many_files(count: usize, what: &str) -> ToolResult {
+    BrowserRefusal::new(
+        BrowserRefusalCode::BrowserActionUnavailable,
+        format!("{what} accepts one file; {count} were given. Upload them one at a time."),
+    )
+    .with_detail(json!({ "accepts_multiple": false, "file_count": count }))
+    .to_tool_result()
+}
+
+async fn set_files(
+    conn: &CdpConnection,
+    cdp: &str,
+    backend_node_id: i64,
+    files: &[String],
+) -> Result<(), ToolResult> {
+    conn.call(
+        Some(cdp),
+        "DOM.setFileInputFiles",
+        json!({ "backendNodeId": backend_node_id, "files": files }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        BrowserRefusal::new(
+            BrowserRefusalCode::BrowserActionUnavailable,
+            format!("the browser refused the exact file input assignment: {error}"),
+        )
+        .to_tool_result()
+    })
 }
 
 #[async_trait]
@@ -2427,13 +2576,6 @@ impl Tool for BrowserSetInputFilesTool {
             Ok(entry) => entry,
             Err(refusal) => return refusal.to_tool_result(),
         };
-        if entry.semantic && !entry.actions.contains(&BrowserActionKind::Upload) {
-            return BrowserRefusal::new(
-                BrowserRefusalCode::BrowserActionUnavailable,
-                "the semantic ref is not a file-upload control",
-            )
-            .to_tool_result();
-        }
         let cdp_session = match self
             .engine
             .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry.frame)
@@ -2442,65 +2584,298 @@ impl Tool for BrowserSetInputFilesTool {
             Ok(session) => session,
             Err(refusal) => return refusal.to_tool_result(),
         };
-        let described = match validated
-            .conn
+        let conn = &validated.conn;
+        let cdp = cdp_session.as_str();
+        let stale = || {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserRefStale,
+                "the upload ref no longer resolves in the live page",
+            )
+            .to_tool_result()
+        };
+        let Some(object_id) = conn
             .call(
-                Some(&cdp_session),
-                "DOM.describeNode",
+                Some(cdp),
+                "DOM.resolveNode",
                 json!({ "backendNodeId": entry.backend_node_id }),
             )
             .await
-        {
-            Ok(node) => node,
-            Err(_) => {
-                return BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserRefStale,
-                    "the upload ref no longer resolves in the live page",
-                )
-                .to_tool_result()
-            }
+            .ok()
+            .and_then(|resolved| resolved["object"]["objectId"].as_str().map(str::to_owned))
+        else {
+            return stale();
         };
-        let node = &described["node"];
-        let attributes = node["attributes"].as_array().cloned().unwrap_or_default();
-        let is_file_input = node["nodeName"]
-            .as_str()
-            .is_some_and(|name| name.eq_ignore_ascii_case("input"))
-            && attributes.chunks_exact(2).any(|pair| {
-                pair[0]
-                    .as_str()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("type"))
-                    && pair[1]
-                        .as_str()
-                        .is_some_and(|value| value.eq_ignore_ascii_case("file"))
-            });
-        if !is_file_input {
+        let count = files.len();
+        let uploaded = |route: &str, text: String| {
+            ToolResult::text(text).with_structured(json!({
+                "status": "ok", "target_id": target_id, "tab_id": tab_id,
+                "ref": ext_ref, "frame": entry.frame.kind.as_str(), "file_count": count,
+                "route": route, "native_picker_shown": false,
+            }))
+        };
+
+        // 1. The ref is the field, or names exactly one: fill it, no activation.
+        if let Some(field) = related_file_field(conn, cdp, &object_id, false).await {
+            if count > 1 && !field.multiple {
+                return too_many_files(count, "the file input for this ref");
+            }
+            if let Err(error) = set_files(conn, cdp, field.backend_node_id, &files).await {
+                return error;
+            }
+            let direct = field.backend_node_id == entry.backend_node_id;
+            return uploaded(
+                if direct {
+                    "file_input"
+                } else {
+                    "related_file_input"
+                },
+                format!(
+                    "assigned {count} file(s) in {tab_id} to {}; no native file picker was shown",
+                    if direct {
+                        "the file input"
+                    } else {
+                        "the file input for the ref"
+                    }
+                ),
+            );
+        }
+
+        // 2. A control that opens a chooser: activate it with the chooser
+        //    intercepted and fill exactly the input that asked.
+        let mut picker_without_element = false;
+        let may_activate = !entry.semantic || entry.actions.contains(&BrowserActionKind::Click);
+        if may_activate {
+            let mut interception = match ChooserInterception::begin(&self.engine, &validated, false)
+                .await
+            {
+                Ok(Some(interception)) => interception,
+                Ok(None) => return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserActionUnavailable,
+                    "this browser cannot intercept file choosers, and the ref is not a file input",
+                )
+                .to_tool_result(),
+                Err(error) => {
+                    return BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserInputTrustUnavailable,
+                        format!("the page's native file picker could not be contained: {error}"),
+                    )
+                    .to_tool_result()
+                }
+            };
+            // Uploading must not raise the window: where trusted input would,
+            // a user-gesture click grants the activation a chooser needs.
+            let trusted_stays_background = validated.record.cdp_window_id.is_none()
+                || self
+                    .engine
+                    .platform
+                    .standalone_trusted_input_background_limitation()
+                    .is_none();
+            let activated = if trusted_stays_background {
+                trusted_click_on_node(conn, cdp, entry.backend_node_id).await
+            } else {
+                gesture_click(conn, cdp, &object_id).await
+            };
+            let chooser = match activated {
+                Ok(()) => interception.next_chooser(CHOOSER_WAIT).await,
+                Err(_) => None,
+            };
+            let outcome = match chooser {
+                Some(chooser) => match chooser.backend_node_id {
+                    Some(_) if count > 1 && !chooser.multiple => {
+                        Some(too_many_files(count, "the file chooser this ref opens"))
+                    }
+                    Some(backend) => Some(
+                        match set_files(conn, &chooser.session_id, backend, &files).await {
+                            Ok(()) => uploaded(
+                                "file_chooser",
+                                format!(
+                                    "activated the ref in {tab_id} and assigned {count} file(s) to the file chooser it opened; no native file picker was shown"
+                                ),
+                            ),
+                            Err(error) => error,
+                        },
+                    ),
+                    None => {
+                        picker_without_element = true;
+                        None
+                    }
+                },
+                None => None,
+            };
+            let _ = interception.finish(Duration::ZERO).await;
+            if let Some(result) = outcome {
+                return result;
+            }
+        }
+
+        // 3. Nothing opened: the single file input around the control.
+        if !picker_without_element {
+            if let Some(field) = related_file_field(conn, cdp, &object_id, true).await {
+                if count > 1 && !field.multiple {
+                    return too_many_files(count, "the file input next to this ref");
+                }
+                if let Err(error) = set_files(conn, cdp, field.backend_node_id, &files).await {
+                    return error;
+                }
+                return uploaded(
+                    "nearby_file_input",
+                    format!(
+                        "the ref opened no file chooser, so {count} file(s) went to the one file input next to it in {tab_id}; no native file picker was shown"
+                    ),
+                );
+            }
+        }
+
+        // 4. A drop zone: drop the files on it as a drag from the desktop would.
+        let _ = conn
+            .call(
+                Some(cdp),
+                "DOM.scrollIntoViewIfNeeded",
+                json!({ "backendNodeId": entry.backend_node_id }),
+            )
+            .await;
+        let Some((x, y)) = conn
+            .call(
+                Some(cdp),
+                "DOM.getBoxModel",
+                json!({ "backendNodeId": entry.backend_node_id }),
+            )
+            .await
+            .ok()
+            .as_ref()
+            .and_then(quad_center)
+        else {
             return BrowserRefusal::new(
                 BrowserRefusalCode::BrowserActionUnavailable,
-                "the live ref is not an input[type=file] element",
+                "the ref is not a file input, opened no file chooser, and has no layout box to drop the files on",
             )
             .to_tool_result();
+        };
+        for event_type in ["dragEnter", "dragOver", "drop"] {
+            if let Err(error) = conn
+                .call(
+                    Some(cdp),
+                    "Input.dispatchDragEvent",
+                    json!({
+                        "type": event_type,
+                        "x": x,
+                        "y": y,
+                        "data": { "items": [], "files": files, "dragOperationsMask": 1 },
+                    }),
+                )
+                .await
+            {
+                if event_type == "dragEnter" {
+                    return BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserActionUnavailable,
+                        format!("the browser refused the file drop: {error}"),
+                    )
+                    .to_tool_result();
+                }
+                let _ = conn
+                    .call(
+                        Some(cdp),
+                        "Input.dispatchDragEvent",
+                        json!({ "type": "dragCancel", "x": x, "y": y, "data": { "items": [], "dragOperationsMask": 1 } }),
+                    )
+                    .await;
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserActionUnavailable,
+                    format!("the file drop stopped at {event_type}: {error}"),
+                )
+                .with_detail(json!({ "delivery": "partial" }))
+                .to_tool_result();
+            }
         }
-        match validated
-            .conn
+        let mut result = uploaded(
+            "drop",
+            format!(
+                "the ref is not a file input and opened no file chooser{}, so {count} file(s) were dropped on it in {tab_id}; whether the page accepted them is not verified. Refresh page state and verify",
+                if picker_without_element { " CDP can fill (it asked for a File System Access picker, kept closed)" } else { "" }
+            ),
+        );
+        if let Some(Value::Object(structured)) = result.structured_content.as_mut() {
+            structured.insert("effect".into(), json!("unverifiable"));
+            structured.insert("x".into(), json!(x));
+            structured.insert("y".into(), json!(y));
+        }
+        result
+    }
+}
+
+/// A user-gesture DOM click: the page gets the transient activation a file
+/// chooser requires without trusted Input, which would activate a
+/// standalone browser window on some platforms.
+async fn gesture_click(conn: &CdpConnection, cdp: &str, object_id: &str) -> anyhow::Result<()> {
+    let clicked = conn
+        .call(
+            Some(cdp),
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": "function() { this.click(); }",
+                "userGesture": true,
+                "awaitPromise": false,
+            }),
+        )
+        .await?;
+    if clicked.get("exceptionDetails").is_some() {
+        anyhow::bail!("the page threw while the ref was activated");
+    }
+    Ok(())
+}
+
+/// The trusted click `browser_click` delivers, at the node's center.
+async fn trusted_click_on_node(
+    conn: &CdpConnection,
+    cdp: &str,
+    backend_node_id: i64,
+) -> anyhow::Result<()> {
+    let _ = conn
+        .call(
+            Some(cdp),
+            "DOM.scrollIntoViewIfNeeded",
+            json!({ "backendNodeId": backend_node_id }),
+        )
+        .await;
+    let box_model = conn
+        .call(
+            Some(cdp),
+            "DOM.getBoxModel",
+            json!({ "backendNodeId": backend_node_id }),
+        )
+        .await?;
+    let (x, y) = quad_center(&box_model)
+        .ok_or_else(|| anyhow::anyhow!("the ref returned an unusable layout box"))?;
+    conn.call(
+        Some(cdp),
+        "Emulation.setFocusEmulationEnabled",
+        json!({ "enabled": true }),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let mut delivered = Ok(());
+    for event_type in ["mousePressed", "mouseReleased"] {
+        if let Err(error) = conn
             .call(
-                Some(&cdp_session),
-                "DOM.setFileInputFiles",
-                json!({ "backendNodeId": entry.backend_node_id, "files": files }),
+                Some(cdp),
+                "Input.dispatchMouseEvent",
+                json!({ "type": event_type, "x": x, "y": y, "button": "left", "clickCount": 1 }),
             )
             .await
         {
-            Ok(_) => ToolResult::text(format!("assigned {} file(s) in {tab_id}", files.len()))
-                .with_structured(json!({
-                    "status": "ok", "target_id": target_id, "tab_id": tab_id,
-                    "ref": ext_ref, "frame": entry.frame.kind.as_str(), "file_count": files.len()
-                })),
-            Err(error) => BrowserRefusal::new(
-                BrowserRefusalCode::BrowserActionUnavailable,
-                format!("the browser refused the exact file input assignment: {error}"),
-            )
-            .to_tool_result(),
+            delivered = Err(error);
+            break;
         }
     }
+    let restored = conn
+        .call(
+            Some(cdp),
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": false }),
+        )
+        .await;
+    delivered.and(restored.map(|_| ()))
 }
 
 #[cfg(test)]

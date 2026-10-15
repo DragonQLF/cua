@@ -18,6 +18,7 @@ use crate::tool_args::ArgsExt;
 
 use super::cdp_ws::CdpConnection;
 use super::engine::{BrowserEngine, ValidatedTab};
+use super::file_chooser::deliver_with_chooser_contained;
 use super::platform::BrowserVisualActionKind;
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::required_session_schema;
@@ -884,14 +885,25 @@ impl Tool for BrowserPointerTool {
                 .await
             }
             InputRoute::Trusted => {
-                self.trusted(
+                let delivery = self.trusted(
                     &session,
                     &request,
                     &validated,
                     origin_ref.as_ref(),
                     destination_ref.as_ref(),
-                )
-                .await
+                );
+                // A button press grants user activation, so the page could
+                // answer it with a native file picker, which stays contained.
+                // Hover and wheel input cannot activate a page.
+                if matches!(request.action, PointerAction::Hover | PointerAction::Scroll) {
+                    return delivery.await;
+                }
+                let external_ref = match &request.origin {
+                    Location::Ref(reference) => Some(reference.as_str()),
+                    Location::Coordinates(_, _) => None,
+                };
+                deliver_with_chooser_contained(&self.engine, &validated, external_ref, delivery)
+                    .await
             }
         }
     }

@@ -430,12 +430,33 @@ cannot resolve its native modal while preserving background posture, so the
 driver refuses that mode before dispatch; retry explicitly with
 `delivery_mode:"foreground"` when foreground activation is acceptable.
 
-### File inputs
+### File inputs and file choosers
 
-Use a current semantic ref whose `actions` contains `upload`, then call
-`browser_set_input_files` with one to 32 absolute regular-file paths. The tool
-rejects symlinks and directories, bypasses the native file picker, and returns
-only the assigned file count. Paths are redacted from trajectory arguments.
+Call `browser_set_input_files` with one to 32 absolute regular-file paths and
+the ref of the file input, or of the label, button, or drop zone for it (a
+hidden input behind an "Attach" button needs no ref of its own). The driver
+uploads the way DevTools does and never opens the native file picker:
+
+1. a file input the ref is, labels, contains, or controls is filled directly;
+2. otherwise the ref is activated with the file chooser intercepted, and the
+   input that asked is filled (`route:"file_chooser"`); the activation is
+   trusted input, or a user-gesture DOM click where trusted input would raise
+   a standalone browser window (macOS, Linux);
+3. a control that opens nothing uses the single file input next to it;
+4. anything else gets the files dropped on it as a desktop drag would
+   (`route:"drop"`, `effect:"unverifiable"`; refresh and verify).
+
+Several files need an input or chooser that accepts several. The tool rejects
+symlinks and directories and returns only the file count and route. Paths are
+redacted from trajectory arguments.
+
+Every trusted `browser_click` and `browser_pointer` action, and the
+activation of `browser_download`, runs with file choosers intercepted in the
+tab and its out-of-process iframes. When the page asked for one, the result
+carries `file_chooser: {requested: true, shown: false}` and names
+`browser_set_input_files` as the next action. File System Access pickers
+(`showOpenFilePicker()` and similar) are intercepted too; the page receives an
+`AbortError`, and CDP has no way to fill them.
 
 ### Downloads
 
@@ -443,9 +464,11 @@ only the assigned file count. Paths are redacted from trajectory arguments.
 approval and saves the result under an existing canonical absolute
 `destination_root`. It correlates browser download events to the exact frame,
 serializes Chromium's browser-wide download setting, restores that setting on
-every outcome, and returns only an opaque download id and byte count. It never
-returns the source URL, filename, or destination path. Direct raw calls without
-the host approval proof are refused.
+every outcome, and saves the file under the site's suggested name, reduced to
+one plain component and never replacing an existing file (`report (1).pdf`).
+It returns that `file_name`, an opaque download id, and the byte count, never
+the source URL or destination path. Downloaded files are untrusted page
+content. Direct raw calls without the host approval proof are refused.
 
 ## Browser chrome and native fallbacks
 
@@ -454,8 +477,7 @@ the normal native loop for:
 
 - tabs, address bar, menus, bookmarks, and extension UI;
 - permission prompts, remote-debugging consent UI, and authentication sheets;
-- native save dialogs and file pickers that are not represented by an exact
-  page ref;
+- native save dialogs, and file pickers the user opens themselves;
 - WebView2, WKWebView, WebKitGTK, Tauri, or Electron surfaces that cannot be
   exactly correlated to a page target;
 - Safari and Firefox, whose typed mutation engines are not yet supported.

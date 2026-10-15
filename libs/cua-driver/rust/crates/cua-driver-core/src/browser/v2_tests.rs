@@ -4,6 +4,7 @@
 //! revalidation, navigation invalidation, and unproven-capability
 //! omission/refusal.
 
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -29,7 +30,7 @@ use super::pointer::BrowserPointerTool;
 use super::refusal::BrowserRefusal;
 use super::tools::{
     browser_protected_resource_scope, BrowserClickTool, BrowserNavigateTool, BrowserPrepareTool,
-    BrowserTypeTool, GetBrowserStateTool,
+    BrowserSetInputFilesTool, BrowserTypeTool, GetBrowserStateTool,
 };
 use super::types::{
     BrowserClassification, BrowserEngineFamily, BrowserProcessRole, BrowserProduct,
@@ -71,6 +72,24 @@ struct FixtureState {
     omit_primary_target: bool,
     /// Make `Browser.getWindowForTarget` for T1 answer this CDP error.
     primary_window_error: Option<(i64, String)>,
+    /// A file chooser the page requests when a control gets user
+    /// activation: `(backendNodeId, mode)`; no backend id models a File
+    /// System Access picker.
+    chooser_on_activation: Option<(Option<i64>, &'static str)>,
+    /// Sessions with the Page domain enabled / chooser interception on.
+    page_enabled: HashSet<String>,
+    intercepting: HashSet<String>,
+    /// Choosers that reached the desktop because nothing intercepted them.
+    native_pickers_shown: usize,
+    /// What the related-file-input probe finds for any ref: directly
+    /// (the ref is, labels, contains, or controls it) or only nearby.
+    related_field_direct: bool,
+    related_field_nearby: bool,
+    related_field_multiple: bool,
+    /// A download the page starts on activation: (suggested name, bytes),
+    /// written under an opaque id into the approved `downloadPath`.
+    download_on_activation: Option<(&'static str, &'static [u8])>,
+    download_path: Option<String>,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -100,6 +119,15 @@ impl Default for FixtureState {
             viewport_css_width: 800.0,
             viewport_css_height: 600.0,
             tab_visible: true,
+            chooser_on_activation: None,
+            page_enabled: HashSet::new(),
+            intercepting: HashSet::new(),
+            native_pickers_shown: 0,
+            related_field_direct: false,
+            related_field_nearby: false,
+            related_field_multiple: false,
+            download_on_activation: None,
+            download_path: None,
             calls: Vec::new(),
         }
     }
@@ -434,7 +462,122 @@ fn fixture_handler(state: SharedState) -> MockHandler {
         let is_tab = sess.starts_with("tab-sess-");
         let is_oopif = sess.starts_with("oopif-sess-");
 
+        // Chromium intercepts a chooser only for a session that has both the
+        // Page domain and interception on; otherwise the native picker shows.
+        let request_chooser = |st: &mut FixtureState| -> Vec<MockEvent> {
+            let Some((backend, mode)) = st.chooser_on_activation else {
+                return Vec::new();
+            };
+            let mut catching: Vec<&String> = st
+                .intercepting
+                .iter()
+                .filter(|session| {
+                    st.page_enabled.contains(*session) && session.starts_with("tab-sess-")
+                })
+                .collect();
+            catching.sort();
+            match catching.first() {
+                Some(session) => {
+                    let mut params = json!({ "frameId": "F_MAIN", "mode": mode });
+                    if let Some(backend) = backend {
+                        params["backendNodeId"] = json!(backend);
+                    }
+                    vec![MockEvent {
+                        method: "Page.fileChooserOpened".into(),
+                        session_id: Some((*session).clone()),
+                        params,
+                    }]
+                }
+                None => {
+                    st.native_pickers_shown += 1;
+                    Vec::new()
+                }
+            }
+        };
+
         match call.method.as_str() {
+            "Page.enable" => {
+                st.page_enabled.insert(sess.clone());
+                MockReply::ok(json!({}))
+            }
+            "Page.disable" => {
+                st.page_enabled.remove(&sess);
+                MockReply::ok(json!({}))
+            }
+            "Page.setInterceptFileChooserDialog" => {
+                if call.params["enabled"].as_bool() == Some(true) {
+                    st.intercepting.insert(sess.clone());
+                } else {
+                    st.intercepting.remove(&sess);
+                }
+                MockReply::ok(json!({}))
+            }
+            "Target.detachFromTarget" => {
+                let detached = call.params["sessionId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                st.intercepting.remove(&detached);
+                st.page_enabled.remove(&detached);
+                MockReply::ok(json!({}))
+            }
+            "DOM.setFileInputFiles" | "Input.dispatchDragEvent" => MockReply::ok(json!({})),
+            "Input.dispatchMouseEvent" if call.params["type"] == "mouseReleased" => {
+                let events = request_chooser(&mut st);
+                MockReply::ok(json!({})).with_events(events)
+            }
+            "Browser.setDownloadBehavior" => {
+                st.download_path = call.params["downloadPath"].as_str().map(str::to_owned);
+                MockReply::ok(json!({}))
+            }
+            "Runtime.callFunctionOn" if call.params["userGesture"] == true => {
+                let mut events = request_chooser(&mut st);
+                if let (Some((name, bytes)), Some(path)) =
+                    (st.download_on_activation, st.download_path.clone())
+                {
+                    let guid = "6a8843d3-2cf2-4723-849c-37e48debd4a9";
+                    std::fs::write(std::path::Path::new(&path).join(guid), bytes).unwrap();
+                    events.push(MockEvent {
+                        method: "Browser.downloadWillBegin".into(),
+                        session_id: None,
+                        params: json!({
+                            "frameId": "F_MAIN", "guid": guid,
+                            "url": "https://fixture.test/report", "suggestedFilename": name
+                        }),
+                    });
+                    events.push(MockEvent {
+                        method: "Browser.downloadProgress".into(),
+                        session_id: None,
+                        params: json!({ "guid": guid, "state": "completed", "receivedBytes": bytes.len() }),
+                    });
+                }
+                MockReply::ok(json!({ "result": { "type": "undefined" } })).with_events(events)
+            }
+            "Runtime.callFunctionOn"
+                if call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("const isFile")) =>
+            {
+                let nearby = call.params["arguments"][0]["value"] == true;
+                if st.related_field_direct || (nearby && st.related_field_nearby) {
+                    MockReply::ok(json!({
+                        "result": { "type": "object", "subtype": "node", "objectId": "related-field" }
+                    }))
+                } else {
+                    MockReply::ok(
+                        json!({ "result": { "type": "object", "subtype": "null", "value": null } }),
+                    )
+                }
+            }
+            "DOM.describeNode" if call.params["objectId"] == "related-field" => {
+                let mut attributes = vec![json!("type"), json!("file")];
+                if st.related_field_multiple {
+                    attributes.extend([json!("multiple"), json!("")]);
+                }
+                MockReply::ok(json!({
+                    "node": { "nodeName": "INPUT", "backendNodeId": 77, "attributes": attributes }
+                }))
+            }
             "Target.getTargets" => {
                 let mut infos: Vec<Value> = Vec::new();
                 if !st.omit_primary_target {
@@ -2610,4 +2753,425 @@ async fn method_unsupported_keeps_the_electron_none_path() {
     let tabs = s["tabs"].as_array().expect("tabs");
     assert_eq!(tabs.len(), 1, "{s}");
     assert_eq!(tabs[0]["url"], "https://fixture.test/");
+}
+
+// ── File choosers, uploads, and drops ────────────────────────────────────────
+
+fn upload_fixture_files(count: usize) -> (tempfile::TempDir, Vec<String>) {
+    let directory = tempfile::tempdir().unwrap();
+    let files = (0..count)
+        .map(|index| {
+            let path = directory.path().join(format!("upload-{index}.txt"));
+            std::fs::write(&path, b"fixture").unwrap();
+            std::fs::canonicalize(path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    (directory, files)
+}
+
+async fn upload(f: &Fixture, target: &str, tab: &str, reference: &str, files: &[String]) -> Value {
+    let result = BrowserSetInputFilesTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": reference,
+            "files": files, "session": SESSION
+        }))
+        .await;
+    structured(&result).clone()
+}
+
+/// After a tool call no session may still intercept: the person's own
+/// clicks must get the native picker back.
+fn assert_interception_released(f: &Fixture) {
+    let st = f.state.lock().unwrap();
+    assert!(
+        st.intercepting.is_empty(),
+        "interception left on: {:?}",
+        st.intercepting
+    );
+    assert_eq!(
+        st.native_pickers_shown, 0,
+        "a native picker reached the desktop"
+    );
+}
+
+#[tokio::test]
+async fn trusted_click_contains_the_file_chooser_it_triggers_and_says_so() {
+    let f = fixture_with(|st| st.chooser_on_activation = Some((Some(41), "selectSingle"))).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+
+    let result = BrowserClickTool::new(f.engine.clone())
+        .invoke(json!({ "target_id": target, "tab_id": tab, "ref": button, "session": SESSION }))
+        .await;
+    let s = structured(&result);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["file_chooser"]["requested"], true, "{s}");
+    assert_eq!(s["file_chooser"]["shown"], false);
+    assert_eq!(s["file_chooser"]["next_action"], "browser_set_input_files");
+    let Content::Text { text, .. } = &result.content[0] else {
+        panic!("text result");
+    };
+    assert!(
+        text.contains(&format!("browser_set_input_files with ref {button}")),
+        "{text}"
+    );
+    assert_interception_released(&f);
+
+    // Interception ran on its own attachment with Page enabled and was
+    // cancelled for an action that only clicks.
+    let intercept = recorded_calls(&f, "Page.setInterceptFileChooserDialog");
+    assert_eq!(intercept.first().unwrap().1["cancel"], true);
+    let interception_session = intercept.first().unwrap().0.clone().unwrap();
+    assert!(recorded_calls(&f, "Page.enable")
+        .iter()
+        .any(|(session, _)| session.as_deref() == Some(interception_session.as_str())));
+    assert!(recorded_calls(&f, "Target.detachFromTarget")
+        .iter()
+        .any(|(_, params)| params["sessionId"] == interception_session.as_str()));
+}
+
+#[tokio::test]
+async fn interception_covers_out_of_process_iframes() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    BrowserClickTool::new(f.engine.clone())
+        .invoke(json!({ "target_id": target, "tab_id": tab, "ref": button, "session": SESSION }))
+        .await;
+    let enabled_on: Vec<String> = recorded_calls(&f, "Page.setInterceptFileChooserDialog")
+        .into_iter()
+        .filter(|(_, params)| params["enabled"] == true)
+        .filter_map(|(session, _)| session)
+        .collect();
+    assert!(
+        enabled_on.iter().any(|s| s.starts_with("tab-sess-")),
+        "{enabled_on:?}"
+    );
+    assert!(
+        enabled_on.iter().any(|s| s.starts_with("oopif-sess-")),
+        "{enabled_on:?}"
+    );
+    let detached: Vec<Value> = recorded_calls(&f, "Target.detachFromTarget")
+        .into_iter()
+        .map(|(_, params)| params["sessionId"].clone())
+        .collect();
+    for session in &enabled_on {
+        assert!(
+            detached.contains(&json!(session)),
+            "{session} still attached: {detached:?}"
+        );
+    }
+    assert_interception_released(&f);
+}
+
+#[tokio::test]
+async fn trusted_pointer_actions_contain_file_choosers_too() {
+    let f = fixture_with(|st| st.chooser_on_activation = Some((Some(41), "selectMultiple"))).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let result = BrowserPointerTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": button,
+            "action": "double_click", "session": SESSION
+        }))
+        .await;
+    let s = structured(&result);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["file_chooser"]["multiple"], true, "{s}");
+    assert_interception_released(&f);
+}
+
+#[tokio::test]
+async fn upload_fills_the_ref_itself_or_the_field_it_names_without_activation() {
+    let f = fixture_with(|st| {
+        st.related_field_direct = true;
+        st.chooser_on_activation = Some((Some(41), "selectSingle"));
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let (_dir, files) = upload_fixture_files(1);
+
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["route"], "related_file_input");
+    assert_eq!(s["native_picker_shown"], false);
+    let set = recorded_calls(&f, "DOM.setFileInputFiles");
+    assert_eq!(set.len(), 1);
+    assert_eq!(set[0].1["backendNodeId"], 77);
+    assert_eq!(set[0].1["files"], json!(files));
+    assert!(
+        recorded_calls(&f, "Input.dispatchMouseEvent").is_empty(),
+        "no activation needed"
+    );
+    assert!(recorded_calls(&f, "Page.setInterceptFileChooserDialog").is_empty());
+}
+
+#[tokio::test]
+async fn upload_refuses_several_files_for_a_single_file_field() {
+    let f = fixture_with(|st| st.related_field_direct = true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let (_dir, files) = upload_fixture_files(2);
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(s["refusal"]["code"], "browser_action_unavailable", "{s}");
+    assert!(recorded_calls(&f, "DOM.setFileInputFiles").is_empty());
+}
+
+#[tokio::test]
+async fn upload_fills_exactly_the_chooser_a_control_opens() {
+    let f = fixture_with(|st| st.chooser_on_activation = Some((Some(41), "selectMultiple"))).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let (_dir, files) = upload_fixture_files(2);
+
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["route"], "file_chooser");
+    assert_eq!(s["file_count"], 2);
+    let set = recorded_calls(&f, "DOM.setFileInputFiles");
+    assert_eq!(set.len(), 1);
+    assert_eq!(set[0].1["backendNodeId"], 41, "the chooser's own element");
+    let intercept = recorded_calls(&f, "Page.setInterceptFileChooserDialog");
+    assert_eq!(
+        set[0].0, intercept[0].0,
+        "filled on the session that intercepted"
+    );
+    assert_eq!(
+        intercept[0].1["cancel"], false,
+        "a chooser about to be filled is not cancelled"
+    );
+    assert!(recorded_calls(&f, "Input.dispatchDragEvent").is_empty());
+    assert_interception_released(&f);
+}
+
+#[tokio::test]
+async fn upload_refuses_several_files_for_a_single_file_chooser() {
+    let f = fixture_with(|st| st.chooser_on_activation = Some((Some(41), "selectSingle"))).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let (_dir, files) = upload_fixture_files(3);
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(s["refusal"]["code"], "browser_action_unavailable", "{s}");
+    assert!(recorded_calls(&f, "DOM.setFileInputFiles").is_empty());
+    assert_interception_released(&f);
+}
+
+#[tokio::test]
+async fn upload_activates_with_a_user_gesture_where_trusted_input_would_raise_the_window() {
+    let f = fixture_with_platform(
+        |st| st.chooser_on_activation = Some((Some(41), "selectSingle")),
+        true,
+    )
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let (_dir, files) = upload_fixture_files(1);
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(s["route"], "file_chooser", "{s}");
+    assert!(recorded_calls(&f, "Input.dispatchMouseEvent").is_empty());
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn")
+        .iter()
+        .any(|(_, params)| params["userGesture"] == true));
+    assert_interception_released(&f);
+}
+
+#[tokio::test]
+async fn upload_uses_the_one_nearby_field_when_the_control_opens_nothing() {
+    let f = fixture_with(|st| st.related_field_nearby = true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let (_dir, files) = upload_fixture_files(1);
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(s["route"], "nearby_file_input", "{s}");
+    assert_eq!(
+        recorded_calls(&f, "DOM.setFileInputFiles")[0].1["backendNodeId"],
+        77
+    );
+    assert_interception_released(&f);
+}
+
+#[tokio::test]
+async fn upload_drops_files_on_a_zone_without_a_field_or_chooser() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let (_dir, files) = upload_fixture_files(2);
+
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["route"], "drop");
+    assert_eq!(s["effect"], "unverifiable");
+    let drags = recorded_calls(&f, "Input.dispatchDragEvent");
+    let kinds: Vec<&str> = drags
+        .iter()
+        .map(|(_, p)| p["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["dragEnter", "dragOver", "drop"]);
+    for (_, params) in &drags {
+        assert_eq!(params["data"]["files"], json!(files));
+        assert_eq!(params["x"], 110.0, "box center of backend 10");
+    }
+    assert!(recorded_calls(&f, "DOM.setFileInputFiles").is_empty());
+    assert_interception_released(&f);
+}
+
+#[tokio::test]
+async fn upload_drops_files_when_the_page_asks_for_a_file_system_access_picker() {
+    let f = fixture_with(|st| {
+        st.chooser_on_activation = Some((None, "selectSingle"));
+        st.related_field_nearby = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let (_dir, files) = upload_fixture_files(1);
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(
+        s["route"], "drop",
+        "a File System Access page wants its own picker, not a nearby field: {s}"
+    );
+    assert!(recorded_calls(&f, "DOM.setFileInputFiles").is_empty());
+    assert_interception_released(&f);
+}
+
+#[tokio::test]
+async fn existing_profile_uploads_stay_within_the_reviewed_cdp_surface() {
+    const TRANSPORT: &str = "transport-v2-upload-policy";
+    let (f, _) = protected_existing_profile_fixture().await;
+    f.state.lock().unwrap().chooser_on_activation = Some((Some(41), "selectMultiple"));
+    let prepare = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1, "window_id": 7, "session": SESSION,
+            "_transport_session_id": TRANSPORT,
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    assert_eq!(
+        structured(&prepare)["status"],
+        "ok",
+        "{}",
+        structured(&prepare)
+    );
+    let state = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1, "window_id": 7, "session": SESSION,
+            "_transport_session_id": TRANSPORT
+        }))
+        .await;
+    let bound = structured(&state).clone();
+    let target = bound["target_id"].as_str().unwrap().to_owned();
+    let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let (_dir, files) = upload_fixture_files(2);
+
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(s["route"], "file_chooser", "{s}");
+    f.state.lock().unwrap().chooser_on_activation = None;
+    let s = upload(&f, &target, &tab, &button, &files).await;
+    assert_eq!(s["route"], "drop", "{s}");
+    assert_interception_released(&f);
+
+    // The policy refuses unreviewed methods before they reach the socket, so
+    // every recorded call is proof the surface was enough.
+    let calls = f.state.lock().unwrap().calls.clone();
+    for (_, method, _) in &calls {
+        assert!(
+            super::cdp_ws::existing_profile_allows(method),
+            "unreviewed method {method}"
+        );
+    }
+    crate::session::fire_session_end(TRANSPORT);
+}
+
+async fn download(
+    f: &Fixture,
+    target: &str,
+    tab: &str,
+    reference: &str,
+    root: &std::path::Path,
+) -> Value {
+    let result = super::download::BrowserDownloadTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": reference,
+            "destination_root": root, "session": SESSION,
+            super::download::MCP_HOST_DOWNLOAD_APPROVAL_ARG: true
+        }))
+        .await;
+    structured(&result).clone()
+}
+
+#[tokio::test]
+async fn download_keeps_the_site_name_and_never_overwrites() {
+    let f = fixture_with(|st| {
+        st.download_on_activation = Some(("../Quarterly report.pdf", b"%PDF-new"))
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let link = ref_of(&snap, "main", "main-btn");
+    let root = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(root.path()).unwrap();
+    std::fs::write(root.join("Quarterly report.pdf"), b"older").unwrap();
+
+    let s = download(&f, &target, &tab, &link, &root).await;
+    assert_eq!(s["status"], "completed", "{s}");
+    assert_eq!(s["file_name"], "Quarterly report (1).pdf");
+    assert_eq!(s["bytes"], 8);
+    assert_eq!(
+        std::fs::read(root.join("Quarterly report.pdf")).unwrap(),
+        b"older"
+    );
+    assert_eq!(
+        std::fs::read(root.join("Quarterly report (1).pdf")).unwrap(),
+        b"%PDF-new"
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["Quarterly report (1).pdf", "Quarterly report.pdf"]);
+    let public = s.to_string();
+    assert!(!public.contains("fixture.test/report"), "{public}");
+    assert!(!public.contains(root.to_str().unwrap()), "{public}");
+    assert_interception_released(&f);
+}
+
+#[tokio::test]
+async fn download_ref_that_asks_for_a_file_chooser_is_refused_without_a_picker() {
+    let f = fixture_with(|st| st.chooser_on_activation = Some((Some(41), "selectSingle"))).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let root = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(root.path()).unwrap();
+    let s = download(&f, &target, &tab, &button, &root).await;
+    assert_eq!(s["refusal"]["code"], "browser_action_unavailable", "{s}");
+    assert_eq!(
+        s["refusal"]["detail"]["next_action"],
+        "browser_set_input_files"
+    );
+    assert_interception_released(&f);
+    let behaviors = recorded_calls(&f, "Browser.setDownloadBehavior");
+    assert_eq!(
+        behaviors.last().unwrap().1["behavior"],
+        "default",
+        "browser-wide routing restored"
+    );
 }

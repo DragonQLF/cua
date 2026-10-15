@@ -68,8 +68,8 @@ end_session({"session": "research-1"})
 | `browser_type` | `insert_text` by default; `mode: "keystrokes"` for per-key events; `replace: true` to overwrite. |
 | `browser_pointer` | `hover`, `right_click`, `double_click`, `scroll`, `drag` (with `destination_ref` in the same frame). |
 | `browser_dialog` | `inspect`, then `accept` or `dismiss` the returned `dialog_id`. Linux needs `delivery_mode: "foreground"`. |
-| `browser_set_input_files` | Absolute paths to regular files (max 32), on a ref with `upload`. |
-| `browser_download` | Into an existing absolute `destination_root` that your policy admits. Returns only a byte count and id. |
+| `browser_set_input_files` | Absolute paths to regular files (max 32), on the file input or the label, button, or drop zone for it. No native picker opens. |
+| `browser_download` | Into an existing absolute `destination_root` that your policy admits, under the site's sanitized file name, never overwriting. Returns that name, a byte count, and an id. |
 | `browser_navigate` | Invalidates every ref on the tab. |
 
 Verify the result with a fresh snapshot. The driver never falls back from

@@ -2,7 +2,10 @@
 //!
 //! Chromium's download behavior is browser-wide, so this tool enables it only
 //! for the bounded interval around one exact ref mutation and restores the
-//! default before returning. Output deliberately omits URLs, filenames, and
+//! default before returning. The browser writes the file under an opaque id;
+//! once it completes, it takes the site's suggested name, sanitized to one
+//! plain component and never replacing an existing file. Output names that
+//! file relative to the approved directory and deliberately omits URLs and
 //! local paths.
 
 use std::path::{Component, Path, PathBuf};
@@ -18,6 +21,7 @@ use crate::tool_args::ArgsExt;
 
 use super::cdp_ws::CdpConnection;
 use super::engine::BrowserEngine;
+use super::file_chooser::{ChooserInterception, CHOOSER_SETTLE};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::required_session_schema;
 use super::store::BrowserActionKind;
@@ -43,7 +47,7 @@ impl BrowserDownloadTool {
         Self {
             def: ToolDef {
                 name: "browser_download".into(),
-                description: "Trigger one download through an exact live browser ref and save it inside an explicitly approved directory. Requires MCP-host destructive-tool approval, refuses ambiguous or stale capabilities, and never returns the source URL, filename, or destination path.".into(),
+                description: "Trigger one download through an exact live browser ref and save it inside an explicitly approved directory under the site's own file name, sanitized to a plain name; an existing file is never overwritten (a numbered name is used instead). Returns that file name. The file comes from the page and is untrusted. Requires MCP-host destructive-tool approval, refuses ambiguous or stale capabilities, never shows a native file picker, and never returns the source URL or destination path.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -190,6 +194,107 @@ fn completed_download_size(root: &Path, guid: &str) -> Result<u64, BrowserRefusa
     Ok(metadata.len())
 }
 
+/// Longest name kept from a site's suggestion, in bytes; numbering and every
+/// mainstream filesystem's 255-byte component limit still fit.
+const MAX_DOWNLOAD_NAME_BYTES: usize = 200;
+const MAX_EXTENSION_BYTES: usize = 24;
+
+/// The site's suggested file name reduced to one plain component that is
+/// safe to create directly inside the approved directory: no separators,
+/// control characters, characters Windows forbids, leading dot (hidden
+/// file), trailing dots or spaces, or reserved device names.
+fn safe_download_name(suggested: Option<&str>) -> String {
+    let base = suggested
+        .unwrap_or("")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        .collect();
+    let mut name = cleaned
+        .trim()
+        .trim_start_matches('.')
+        .trim_end_matches(['.', ' '])
+        .trim()
+        .to_owned();
+    if name.is_empty() {
+        name = "download".to_owned();
+    }
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        name.insert(0, '_');
+    }
+    if name.len() > MAX_DOWNLOAD_NAME_BYTES {
+        let (stem, extension) = split_extension(&name);
+        let extension = if extension.len() <= MAX_EXTENSION_BYTES {
+            extension
+        } else {
+            ""
+        };
+        let mut keep = MAX_DOWNLOAD_NAME_BYTES - extension.len();
+        while !stem.is_char_boundary(keep) {
+            keep -= 1;
+        }
+        name = format!("{}{extension}", stem[..keep].trim_end());
+    }
+    name
+}
+
+/// `("report", ".pdf")`; a name without a dot after its first character has
+/// no extension.
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => name.split_at(dot),
+        _ => (name, ""),
+    }
+}
+
+/// Give the completed opaque-id file its sanitized name inside `root`, never
+/// replacing an existing file: `report.pdf`, then `report (1).pdf`, and so
+/// on. Returns the name the file ends up with.
+fn place_download(root: &Path, guid: &str, suggested: Option<&str>) -> String {
+    let source = root.join(guid);
+    let wanted = safe_download_name(suggested);
+    let (stem, extension) = split_extension(&wanted);
+    for attempt in 0..1000u32 {
+        let candidate = if attempt == 0 {
+            wanted.clone()
+        } else {
+            format!("{stem} ({attempt}){extension}")
+        };
+        if candidate == guid {
+            return candidate;
+        }
+        let target = root.join(&candidate);
+        // A hard link fails instead of replacing an existing name, and keeps
+        // the browser's metadata (such as a quarantine mark) on the file.
+        match std::fs::hard_link(&source, &target) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&source);
+                return candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                // Filesystems without hard links: check, then rename.
+                if std::fs::symlink_metadata(&target).is_ok() {
+                    continue;
+                }
+                if std::fs::rename(&source, &target).is_ok() {
+                    return candidate;
+                }
+                return guid.to_owned();
+            }
+        }
+    }
+    guid.to_owned()
+}
+
 async fn reset_download_behavior(conn: &CdpConnection) {
     let _ = conn
         .call(
@@ -201,8 +306,13 @@ async fn reset_download_behavior(conn: &CdpConnection) {
 }
 
 enum DownloadEventOutcome {
-    Completed { guid: String },
-    Canceled { guid: String },
+    Completed {
+        guid: String,
+        suggested_filename: Option<String>,
+    },
+    Canceled {
+        guid: String,
+    },
     EventStreamClosed,
 }
 
@@ -211,6 +321,7 @@ async fn await_download(
     expected_frame_id: &str,
     observed_guid: &mut Option<String>,
 ) -> DownloadEventOutcome {
+    let mut suggested_filename = None;
     while let Some(event) = events.recv().await {
         match event.method.as_str() {
             "Browser.downloadWillBegin" if observed_guid.is_none() => {
@@ -220,6 +331,11 @@ async fn await_download(
                 *observed_guid = event
                     .params
                     .get("guid")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                suggested_filename = event
+                    .params
+                    .get("suggestedFilename")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
             }
@@ -234,6 +350,7 @@ async fn await_download(
                     Some("completed") => {
                         return DownloadEventOutcome::Completed {
                             guid: guid.to_owned(),
+                            suggested_filename,
                         }
                     }
                     Some("canceled") => {
@@ -433,6 +550,21 @@ impl Tool for BrowserDownloadTool {
             .to_tool_result();
         }
 
+        // The activation carries a user gesture: a ref that asks for a file
+        // chooser instead of downloading must not open a native picker.
+        let interception = match ChooserInterception::begin(&self.engine, &validated, true).await {
+            Ok(interception) => interception,
+            Err(error) => {
+                reset_download_behavior(&validated.conn).await;
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserInputTrustUnavailable,
+                    format!(
+                        "the page's native file picker could not be contained, so the ref was not activated: {error}"
+                    ),
+                )
+                .to_tool_result();
+            }
+        };
         let trigger = validated
             .conn
             .call(
@@ -449,6 +581,19 @@ impl Tool for BrowserDownloadTool {
         let trigger_failed = trigger
             .as_ref()
             .map_or(true, |result| result.get("exceptionDetails").is_some());
+        let choosers = match interception {
+            Some(interception) => interception.finish(CHOOSER_SETTLE).await,
+            None => Vec::new(),
+        };
+        if !choosers.is_empty() {
+            reset_download_behavior(&validated.conn).await;
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserActionUnavailable,
+                "the ref asked for a file chooser, not a download; no native picker was shown. To upload, use browser_set_input_files with this ref",
+            )
+            .with_detail(json!({ "file_chooser": { "requested": true, "shown": false }, "next_action": "browser_set_input_files" }))
+            .to_tool_result();
+        }
         if trigger_failed {
             reset_download_behavior(&validated.conn).await;
             return BrowserRefusal::new(
@@ -467,13 +612,25 @@ impl Tool for BrowserDownloadTool {
         reset_download_behavior(&validated.conn).await;
 
         match outcome {
-            Ok(DownloadEventOutcome::Completed { guid }) => {
-                match completed_download_size(&destination_root, &guid) {
-                    Ok(bytes) => ToolResult::text("browser download completed").with_structured(
-                        json!({ "status": "completed", "download_id": guid, "bytes": bytes }),
-                    ),
-                    Err(refusal) => refusal.to_tool_result(),
-                }
+            Ok(DownloadEventOutcome::Completed {
+                guid,
+                suggested_filename,
+            }) => {
+                let bytes = match completed_download_size(&destination_root, &guid) {
+                    Ok(bytes) => bytes,
+                    Err(refusal) => return refusal.to_tool_result(),
+                };
+                let file_name =
+                    place_download(&destination_root, &guid, suggested_filename.as_deref());
+                ToolResult::text(format!(
+                    "browser download completed: saved {file_name} ({bytes} bytes) in the approved directory"
+                ))
+                .with_structured(json!({
+                    "status": "completed",
+                    "download_id": guid,
+                    "file_name": file_name,
+                    "bytes": bytes,
+                }))
             }
             Ok(DownloadEventOutcome::Canceled { guid }) => {
                 remove_proven_partial(&destination_root, Some(&guid));
@@ -568,6 +725,53 @@ mod tests {
 
         remove_proven_partial(&canonical, Some("opaque-guid"));
         assert!(!partial.exists());
+    }
+
+    #[test]
+    fn suggested_names_become_one_plain_component() {
+        assert_eq!(safe_download_name(Some("report.pdf")), "report.pdf");
+        assert_eq!(safe_download_name(Some("../../etc/passwd")), "passwd");
+        assert_eq!(safe_download_name(Some("..\\..\\boot.ini")), "boot.ini");
+        assert_eq!(safe_download_name(Some(".bashrc")), "bashrc");
+        assert_eq!(
+            safe_download_name(Some("a<b>c:d|e?f*g\"h\u{0007}.txt")),
+            "abcdefgh.txt"
+        );
+        assert_eq!(safe_download_name(Some("trailing. . ")), "trailing");
+        assert_eq!(safe_download_name(Some("CON.txt")), "_CON.txt");
+        assert_eq!(safe_download_name(Some("com1")), "_com1");
+        assert_eq!(safe_download_name(Some("..")), "download");
+        assert_eq!(safe_download_name(None), "download");
+        let long = format!("{}.pdf", "é".repeat(300));
+        let bounded = safe_download_name(Some(&long));
+        assert!(
+            bounded.len() <= MAX_DOWNLOAD_NAME_BYTES,
+            "{}",
+            bounded.len()
+        );
+        assert!(bounded.ends_with(".pdf"));
+    }
+
+    #[test]
+    fn placing_a_download_never_replaces_an_existing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::write(root.join("report.pdf"), b"older").unwrap();
+        std::fs::write(root.join("report (1).pdf"), b"older too").unwrap();
+        std::fs::write(root.join("opaque-guid"), b"fresh").unwrap();
+
+        let name = place_download(&root, "opaque-guid", Some("../report.pdf"));
+        assert_eq!(name, "report (2).pdf");
+        assert_eq!(std::fs::read(root.join("report.pdf")).unwrap(), b"older");
+        assert_eq!(
+            std::fs::read(root.join("report (1).pdf")).unwrap(),
+            b"older too"
+        );
+        assert_eq!(std::fs::read(root.join(&name)).unwrap(), b"fresh");
+        assert!(!root.join("opaque-guid").exists(), "the opaque id is gone");
+
+        std::fs::write(root.join("second-guid"), b"x").unwrap();
+        assert_eq!(place_download(&root, "second-guid", None), "download");
     }
 
     #[test]

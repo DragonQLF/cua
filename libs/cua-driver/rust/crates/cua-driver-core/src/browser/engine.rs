@@ -269,7 +269,7 @@ fn viewport_point_to_screen(
 /// Whether a CDP error is Chromium's "method not implemented" shape.
 /// Everything else stays a hard failure — a transient error must never
 /// be misread as a capability gap.
-fn is_method_unsupported(error: &anyhow::Error) -> bool {
+pub(crate) fn is_method_unsupported(error: &anyhow::Error) -> bool {
     error.to_string().contains("(-32601)")
 }
 
@@ -1199,7 +1199,7 @@ impl BrowserEngine {
     }
 
     /// Attach (flattened) to a tab's target and return the CDP session id.
-    async fn attach(
+    pub(crate) async fn attach(
         &self,
         conn: &CdpConnection,
         cdp_target_id: &str,
@@ -1789,7 +1789,7 @@ impl BrowserEngine {
     /// page target) is ignored. Each operation attaches its own fresh
     /// tab session, so the parent-session filter is per-operation
     /// unique even on the shared pooled connection.
-    async fn attached_iframe_children(
+    pub(crate) async fn attached_iframe_children(
         &self,
         conn: &CdpConnection,
         tab_session: &str,

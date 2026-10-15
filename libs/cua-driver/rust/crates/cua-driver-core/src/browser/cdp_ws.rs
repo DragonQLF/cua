@@ -52,16 +52,19 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "DOM.setFileInputFiles",
     "DOMSnapshot.captureSnapshot",
     "Emulation.setFocusEmulationEnabled",
+    "Input.dispatchDragEvent",
     "Input.dispatchKeyEvent",
     "Input.dispatchMouseEvent",
     "Input.insertText",
     "Page.bringToFront",
     "Page.captureScreenshot",
+    "Page.disable",
     "Page.enable",
     "Page.getFrameTree",
     "Page.getLayoutMetrics",
     "Page.handleJavaScriptDialog",
     "Page.navigate",
+    "Page.setInterceptFileChooserDialog",
     "Runtime.callFunctionOn",
     "Runtime.evaluate",
     "Target.activateTarget",
@@ -70,6 +73,11 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Target.getTargets",
     "Target.setAutoAttach",
 ];
+
+#[cfg(test)]
+pub(crate) fn existing_profile_allows(method: &str) -> bool {
+    CdpMethodPolicy::ExistingProfile.allows(method)
+}
 
 impl CdpMethodPolicy {
     fn allows(self, method: &str) -> bool {
@@ -668,6 +676,21 @@ mod tests {
             "",
         ] {
             assert!(validate_loopback_ws_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn existing_profile_methods_stay_sorted_for_binary_search() {
+        assert!(EXISTING_PROFILE_METHODS
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+        for method in [
+            "Page.setInterceptFileChooserDialog",
+            "Page.disable",
+            "Input.dispatchDragEvent",
+            "DOM.setFileInputFiles",
+        ] {
+            assert!(CdpMethodPolicy::ExistingProfile.allows(method), "{method}");
         }
     }
 

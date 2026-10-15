@@ -93,6 +93,11 @@ fn standalone_browser_completeness_html() -> String {
   <span id="standalone-dialog-state" data-cua-id="standalone-dialog-state">dialog=none</span>
   <input id="standalone-upload" data-cua-id="standalone-upload" aria-label="standalone-upload" type="file" multiple>
   <span id="standalone-upload-state" data-cua-id="standalone-upload-state">upload=0</span>
+  <button id="standalone-attach" data-cua-id="standalone-attach" type="button">Attach files</button>
+  <input id="standalone-hidden-upload" data-cua-id="standalone-hidden-upload" type="file" multiple hidden>
+  <span id="standalone-hidden-upload-state" data-cua-id="standalone-hidden-upload-state">hidden_upload=0</span>
+  <div id="standalone-file-drop" data-cua-id="standalone-file-drop" role="button" tabindex="0" aria-label="standalone-file-drop" style="width:160px;height:60px;border:1px dashed">Drop files</div>
+  <span id="standalone-file-drop-state" data-cua-id="standalone-file-drop-state">file_drop=0</span>
   <a id="standalone-download" data-cua-id="standalone-download" aria-label="standalone-download" href="/download" download>Download fixture</a>
   <span id="standalone-hover-state" data-cua-id="standalone-hover-state">hover=false</span>
 </fieldset>
@@ -110,6 +115,20 @@ fn standalone_browser_completeness_html() -> String {
   document.getElementById('standalone-upload').addEventListener('change', event => {
     const names = Array.from(event.target.files).map(file => file.name).join(',');
     document.getElementById('standalone-upload-state').textContent = `upload=${event.target.files.length}:${names}`;
+  });
+  document.getElementById('standalone-attach').addEventListener('click', () => {
+    document.getElementById('standalone-hidden-upload').click();
+  });
+  document.getElementById('standalone-hidden-upload').addEventListener('change', event => {
+    const names = Array.from(event.target.files).map(file => file.name).join(',');
+    document.getElementById('standalone-hidden-upload-state').textContent = `hidden_upload=${event.target.files.length}:${names}`;
+  });
+  const fileDrop = document.getElementById('standalone-file-drop');
+  fileDrop.addEventListener('dragover', event => event.preventDefault());
+  fileDrop.addEventListener('drop', event => {
+    event.preventDefault();
+    const names = Array.from(event.dataTransfer.files).map(file => file.name).join(',');
+    document.getElementById('standalone-file-drop-state').textContent = `file_drop=${event.dataTransfer.files.length}:${names}`;
   });
   document.getElementById('drag-source').setAttribute('tabindex', '0');
   document.getElementById('drag-source').setAttribute('role', 'button');
@@ -4615,6 +4634,82 @@ fn run_upload(spec: &BrowserSpec) {
     });
 }
 
+fn run_upload_through_controls(spec: &BrowserSpec) {
+    let scenario = format!(
+        "{}-{}-standalone-upload-controls",
+        std::env::consts::OS,
+        spec.name
+    );
+    execute_case(
+        case(&spec.name, "browser_file_upload_controls"),
+        |evidence| {
+            let mut fixture =
+                launch_browser_with_html(spec, &scenario, standalone_browser_completeness_html());
+            *evidence = recording_evidence(fixture.driver.recording_dir());
+            run_with_background_oracles(&mut fixture, |fixture| {
+                let session = format!("standalone-upload-controls-{}", fixture.pid);
+                let (target, tab, snapshot) = bind(fixture, &session);
+                let directory = tempfile::tempdir().expect("create upload fixture directory");
+                let files: Vec<PathBuf> = ["first.txt", "second.txt"]
+                    .iter()
+                    .map(|name| {
+                        let path = directory.path().join(name);
+                        std::fs::write(&path, b"fixture upload payload")
+                            .expect("write upload fixture");
+                        std::fs::canonicalize(path).expect("canonical upload fixture")
+                    })
+                    .collect();
+
+                // A button whose handler opens a hidden multi-file input.
+                let attached = fixture.driver.call(
+                    "browser_set_input_files",
+                    serde_json::json!({
+                        "target_id": target,
+                        "tab_id": tab,
+                        "ref": ref_by_label(&snapshot, "id=standalone-attach"),
+                        "files": files,
+                        "session": session,
+                    }),
+                );
+                assert_eq!(attached.structured()["status"], "ok", "{}", attached.raw);
+                assert_eq!(
+                    attached.structured()["route"],
+                    "file_chooser",
+                    "{}",
+                    attached.raw
+                );
+                assert_eq!(attached.structured()["native_picker_shown"], false);
+                wait_for_text(
+                    &fixture.server,
+                    "standalone-hidden-upload-state",
+                    "hidden_upload=2:first.txt,second.txt",
+                );
+
+                // A drop zone with no file input at all.
+                let dropped = fixture.driver.call(
+                    "browser_set_input_files",
+                    serde_json::json!({
+                        "target_id": target,
+                        "tab_id": tab,
+                        "ref": ref_by_label(&snapshot, "id=standalone-file-drop"),
+                        "files": [files[0]],
+                        "session": session,
+                    }),
+                );
+                assert_eq!(dropped.structured()["route"], "drop", "{}", dropped.raw);
+                wait_for_text(
+                    &fixture.server,
+                    "standalone-file-drop-state",
+                    "file_drop=1:first.txt",
+                );
+                let public = format!("{}{}", attached.raw, dropped.raw);
+                assert!(!public.contains(&directory.path().display().to_string()));
+                Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
+            })
+        },
+    );
+}
+
 fn run_pointer_actions(spec: &BrowserSpec) {
     let scenario = format!("{}-{}-standalone-pointer", std::env::consts::OS, spec.name);
     execute_case(case(&spec.name, "browser_pointer_actions"), |evidence| {
@@ -4787,6 +4882,8 @@ fn run_download(spec: &BrowserSpec) {
                 .collect::<Result<Vec<_>, _>>()
                 .expect("enumerate approved download directory");
             assert_eq!(entries.len(), 1, "expected one completed download");
+            assert_eq!(entries[0].file_name(), "fixture.txt", "the site's own name");
+            assert_eq!(downloaded.structured()["file_name"], "fixture.txt");
             let bytes = std::fs::read(entries[0].path()).expect("read completed download");
             assert_eq!(bytes, b"CUA_DRIVER_BROWSER_DOWNLOAD_FIXTURE_V1\n");
             assert_eq!(
@@ -4797,7 +4894,6 @@ fn run_download(spec: &BrowserSpec) {
             );
             let public = downloaded.raw.to_string();
             assert!(!public.contains(&destination.path().display().to_string()));
-            assert!(!public.contains("fixture.txt"));
             assert!(!public.contains(fixture.server.download_url()));
             Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
         })
@@ -5097,6 +5193,10 @@ standalone_browser_test!(
     run_capture_bound_pixel_click_background_refusal
 );
 standalone_browser_test!(standalone_browser_upload, run_upload);
+standalone_browser_test!(
+    standalone_browser_upload_through_controls,
+    run_upload_through_controls
+);
 standalone_browser_test!(standalone_browser_pointer_actions, run_pointer_actions);
 standalone_browser_test!(standalone_browser_download, run_download);
 standalone_browser_test!(

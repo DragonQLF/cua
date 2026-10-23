@@ -607,6 +607,7 @@ impl AgentSessionState {
                 | "browser_set_input_files"
                 | "browser_download"
                 | "browser_pointer"
+                | "browser_select"
         );
         let refused = outcome.refusal_code.is_refusal();
         let completed_computer_action = computer_action && !refused;
@@ -3672,6 +3673,7 @@ mod tests {
                 ToolOperation::BrowserSetInputFiles,
             ),
             ("browser_download", ToolOperation::BrowserDownload),
+            ("browser_select", ToolOperation::BrowserSelect),
             (
                 "browser_pointer",
                 ToolOperation::BrowserPointerDoubleClickDomEvent,

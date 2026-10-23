@@ -28,6 +28,7 @@ use super::platform::{
 };
 use super::pointer::BrowserPointerTool;
 use super::refusal::BrowserRefusal;
+use super::select::BrowserSelectTool;
 use super::tools::{
     browser_protected_resource_scope, BrowserClickTool, BrowserNavigateTool, BrowserPrepareTool,
     BrowserSetInputFilesTool, BrowserTypeTool, GetBrowserStateTool,
@@ -90,6 +91,11 @@ struct FixtureState {
     /// written under an opaque id into the approved `downloadPath`.
     download_on_activation: Option<(&'static str, &'static [u8])>,
     download_path: Option<String>,
+    /// A form with a native country <select> and a "Next" button, and what
+    /// the page answers to the native and ARIA select functions.
+    select_page: bool,
+    native_select_reply: Value,
+    aria_select_reply: Value,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -128,6 +134,9 @@ impl Default for FixtureState {
             related_field_multiple: false,
             download_on_activation: None,
             download_path: None,
+            select_page: false,
+            native_select_reply: Value::Null,
+            aria_select_reply: Value::Null,
             calls: Vec::new(),
         }
     }
@@ -428,6 +437,32 @@ fn semantic_layout_snapshot(backends: &[i64], bounds: &[[f64; 4]]) -> Value {
     })
 }
 
+fn select_document() -> Value {
+    let option = |backend: i64, label: &str| {
+        json!({"nodeType": 1, "nodeName": "OPTION", "backendNodeId": backend,
+               "children": [{"nodeType": 3, "nodeName": "#text", "nodeValue": label}]})
+    };
+    json!({
+        "root": {
+            "nodeType": 9,
+            "nodeName": "#document",
+            "documentURL": "https://fixture.test/",
+            "frameId": "F_MAIN",
+            "children": [{
+                "nodeType": 1,
+                "nodeName": "HTML",
+                "backendNodeId": 1,
+                "children": [
+                    {"nodeType": 1, "nodeName": "SELECT", "backendNodeId": 40,
+                     "children": [option(41, "Selecionar"), option(42, "Países Baixos"), option(43, "Portugal")]},
+                    {"nodeType": 1, "nodeName": "BUTTON", "backendNodeId": 44,
+                     "attributes": ["id", "next"]}
+                ]
+            }]
+        }
+    })
+}
+
 fn oopif_document() -> Value {
     json!({
         "root": {
@@ -648,6 +683,38 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     }
                 }
             })),
+            "DOM.getDocument" if is_tab && st.select_page => MockReply::ok(select_document()),
+            "Accessibility.getFullAXTree" if is_tab && st.select_page => {
+                MockReply::ok(json!({"nodes": [
+                    {"nodeId": "root", "ignored": false, "role": {"value": "RootWebArea"},
+                     "childIds": ["country", "next"]},
+                    {"nodeId": "country", "parentId": "root", "ignored": false,
+                     "backendDOMNodeId": 40, "role": {"value": "combobox"},
+                     "name": {"value": "País ou região"}, "value": {"value": "Selecionar"},
+                     "properties": [{"name": "expanded", "value": {"value": false}}]},
+                    {"nodeId": "next", "parentId": "root", "ignored": false,
+                     "backendDOMNodeId": 44, "role": {"value": "button"},
+                     "name": {"value": "Seguinte"}}
+                ]}))
+            }
+            "Runtime.callFunctionOn"
+                if call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("const isSelect")) =>
+            {
+                MockReply::ok(
+                    json!({ "result": { "type": "object", "value": st.native_select_reply.clone() } }),
+                )
+            }
+            "Runtime.callFunctionOn"
+                if call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|f| f.contains("const findOptions")) =>
+            {
+                MockReply::ok(
+                    json!({ "result": { "type": "object", "value": st.aria_select_reply.clone() } }),
+                )
+            }
             "DOM.getDocument" if is_tab => {
                 let depth = call.params["depth"].as_i64().unwrap_or(-1);
                 if st.semantic_full_dom_times_out && (depth == -1 || depth > 8) {
@@ -3174,4 +3241,172 @@ async fn download_ref_that_asks_for_a_file_chooser_is_refused_without_a_picker()
         "default",
         "browser-wide routing restored"
     );
+}
+
+// ── Dropdowns ────────────────────────────────────────────────────────────────
+
+async fn select_option(
+    f: &Fixture,
+    target: &str,
+    tab: &str,
+    reference: &str,
+    option: &str,
+) -> ToolResult {
+    BrowserSelectTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target,
+            "tab_id": tab,
+            "session": SESSION,
+            "ref": reference,
+            "option": option,
+        }))
+        .await
+}
+
+fn semantic_ref_named(snapshot: &Value, name: &str) -> Value {
+    snapshot["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("no ref named {name:?}: {snapshot}"))
+        .clone()
+}
+
+fn no_input_or_activation(f: &Fixture) {
+    for method in [
+        "Input.dispatchMouseEvent",
+        "Input.dispatchKeyEvent",
+        "Input.insertText",
+        "Page.bringToFront",
+        "Target.activateTarget",
+    ] {
+        assert!(recorded_calls(f, method).is_empty(), "{method} was sent");
+    }
+}
+
+#[tokio::test]
+async fn native_select_lists_its_options_and_is_chosen_through_the_page() {
+    let f = fixture_with(|st| {
+        st.select_page = true;
+        st.native_select_reply = json!({
+            "kind": "native", "label": "Portugal", "value": "PT",
+            "changed": true, "kept": true, "now": "Portugal"
+        });
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    let country = semantic_ref_named(&snap, "País ou região");
+    assert_eq!(
+        country["options"],
+        json!(["Selecionar", "Países Baixos", "Portugal"])
+    );
+    assert!(country.get("options_total").is_none());
+    assert!(country["actions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("select")));
+
+    let result = select_option(
+        &f,
+        &target,
+        &tab,
+        country["ref"].as_str().unwrap(),
+        "portugal",
+    )
+    .await;
+    let s = structured(&result);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["route"], "native_select");
+    assert_eq!(s["effect"], "verified");
+    assert_eq!(s["label"], "Portugal");
+    assert_eq!(s["native_menu_shown"], false);
+    let calls = recorded_calls(&f, "Runtime.callFunctionOn");
+    assert_eq!(
+        calls.len(),
+        1,
+        "the ARIA path must not run for a native select"
+    );
+    assert_eq!(calls[0].1["arguments"][0]["value"], "portugal");
+    assert_eq!(calls[0].1["objectId"], "obj-40");
+    no_input_or_activation(&f);
+}
+
+#[tokio::test]
+async fn select_without_a_match_returns_the_options_there_are() {
+    let f = fixture_with(|st| {
+        st.select_page = true;
+        st.native_select_reply = json!({
+            "kind": "native", "error": "no_match",
+            "options": ["Selecionar", "Países Baixos", "Portugal"], "options_total": 3
+        });
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    let country = semantic_ref_named(&snap, "País ou região");
+    let result = select_option(
+        &f,
+        &target,
+        &tab,
+        country["ref"].as_str().unwrap(),
+        "Espanha",
+    )
+    .await;
+    let s = structured(&result);
+    assert_eq!(s["refusal"]["code"], "browser_action_unavailable");
+    let text = match &result.content[0] {
+        Content::Text { text, .. } => text.clone(),
+        other => panic!("expected text, got {other:?}"),
+    };
+    assert!(text.contains("\"Portugal\""), "{text}");
+    assert_eq!(s["refusal"]["detail"]["options_total"], 3);
+}
+
+#[tokio::test]
+async fn select_falls_back_to_the_aria_listbox_when_there_is_no_native_select() {
+    let f = fixture_with(|st| {
+        st.select_page = true;
+        st.native_select_reply = json!({ "kind": "none" });
+        st.aria_select_reply = json!({ "kind": "aria", "label": "English (UK)", "verified": true });
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    let country = semantic_ref_named(&snap, "País ou região");
+    let result = select_option(
+        &f,
+        &target,
+        &tab,
+        country["ref"].as_str().unwrap(),
+        "English (UK)",
+    )
+    .await;
+    let s = structured(&result);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["route"], "aria_listbox");
+    assert_eq!(s["effect"], "verified");
+    let calls = recorded_calls(&f, "Runtime.callFunctionOn");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].1["awaitPromise"], true);
+    no_input_or_activation(&f);
+}
+
+#[tokio::test]
+async fn select_refuses_refs_that_are_not_dropdowns_before_touching_the_page() {
+    let f = fixture_with(|st| st.select_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    let next = semantic_ref_named(&snap, "Seguinte");
+    assert!(!next["actions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("select")));
+    let result = select_option(&f, &target, &tab, next["ref"].as_str().unwrap(), "Portugal").await;
+    assert_eq!(
+        structured(&result)["refusal"]["code"],
+        "browser_action_unavailable"
+    );
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
 }

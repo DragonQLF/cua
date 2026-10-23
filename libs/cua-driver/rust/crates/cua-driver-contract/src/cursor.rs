@@ -221,6 +221,7 @@ pub fn classify_cursor_semantics(name: &str, args: &Value) -> Option<CursorSeman
         | "double_click"
         | "right_click"
         | "browser_click"
+        | "browser_select"
         | "browser_double_click"
         | "browser_right_click" => CursorAction::Click,
 

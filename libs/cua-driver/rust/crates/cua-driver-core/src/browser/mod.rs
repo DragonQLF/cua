@@ -51,6 +51,7 @@ pub mod pointer;
 mod prepare;
 mod reconnect;
 pub mod refusal;
+pub mod select;
 mod semantic;
 mod setup_descriptor;
 pub mod store;

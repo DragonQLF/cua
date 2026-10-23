@@ -67,6 +67,7 @@ end_session({"session": "research-1"})
 | `browser_click` | Trusted CDP input by default. Works fully in the background for Chrome and Edge on Windows; macOS and Linux return `browser_input_trust_unavailable` because the browser would activate. Pass `input_route: "dom_event"` for a synthetic DOM click that stays in the background but returns `effect: "unverifiable"`. |
 | `browser_type` | `insert_text` by default; `mode: "keystrokes"` for per-key events; `replace: true` to overwrite. |
 | `browser_pointer` | `hover`, `right_click`, `double_click`, `scroll`, `drag` (with `destination_ref` in the same frame). |
+| `browser_select` | Chooses a dropdown option by label or value, in the background: a native `<select>` is set through the page (its menu cannot be clicked), an ARIA combobox or listbox is opened in the page. |
 | `browser_dialog` | `inspect`, then `accept` or `dismiss` the returned `dialog_id`. Linux needs `delivery_mode: "foreground"`. |
 | `browser_set_input_files` | Absolute paths to regular files (max 32), on the file input or the label, button, or drop zone for it. No native picker opens. |
 | `browser_download` | Into an existing absolute `destination_root` that your policy admits, under the site's sanitized file name, never overwriting. Returns that name, a byte count, and an id. |

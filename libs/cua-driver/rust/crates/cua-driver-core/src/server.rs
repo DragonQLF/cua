@@ -306,6 +306,7 @@ pub enum ToolOperation {
     BrowserDialogDismiss,
     BrowserSetInputFiles,
     BrowserDownload,
+    BrowserSelect,
     BrowserPointerHoverTrusted,
     BrowserPointerHoverDomEvent,
     BrowserPointerRightClickTrusted,
@@ -344,6 +345,7 @@ impl ToolOperation {
             Self::BrowserDialogDismiss => "browser_dialog_dismiss",
             Self::BrowserSetInputFiles => "browser_set_input_files",
             Self::BrowserDownload => "browser_download",
+            Self::BrowserSelect => "browser_select",
             Self::BrowserPointerHoverTrusted => "browser_pointer_hover_trusted",
             Self::BrowserPointerHoverDomEvent => "browser_pointer_hover_dom_event",
             Self::BrowserPointerRightClickTrusted => "browser_pointer_right_click_trusted",
@@ -423,6 +425,7 @@ pub fn tool_operation(tool_name: &str, args: Option<&serde_json::Value>) -> Tool
         },
         "browser_set_input_files" => ToolOperation::BrowserSetInputFiles,
         "browser_download" => ToolOperation::BrowserDownload,
+        "browser_select" => ToolOperation::BrowserSelect,
         "browser_pointer" => match (string_arg("action"), string_arg("input_route")) {
             (Some("hover"), None | Some("trusted")) => ToolOperation::BrowserPointerHoverTrusted,
             (Some("hover"), Some("dom_event")) => ToolOperation::BrowserPointerHoverDomEvent,
@@ -471,7 +474,7 @@ pub fn is_computer_action(tool_name: &str, operation: ToolOperation) -> bool {
     }
     if matches!(
         tool_name,
-        "browser_set_input_files" | "browser_download" | "browser_pointer"
+        "browser_set_input_files" | "browser_download" | "browser_pointer" | "browser_select"
     ) {
         return true;
     }
@@ -725,6 +728,7 @@ fn structured_refusal_code(tool_name: &str, result: Option<&serde_json::Value>) 
             | "browser_set_input_files"
             | "browser_download"
             | "browser_pointer"
+            | "browser_select"
     ) {
         return ToolRefusalCode::None;
     }
@@ -1407,6 +1411,11 @@ mod observation_tests {
                 "browser_download",
                 serde_json::json!({"destination_root": "/private/destination"}),
                 ToolOperation::BrowserDownload,
+            ),
+            (
+                "browser_select",
+                serde_json::json!({"option": "private choice", "ref": "private-ref"}),
+                ToolOperation::BrowserSelect,
             ),
             (
                 "browser_pointer",

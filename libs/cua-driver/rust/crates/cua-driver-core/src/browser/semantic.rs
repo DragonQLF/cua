@@ -26,6 +26,9 @@ pub(crate) const SEMANTIC_COMPUTED_STYLES: &[&str] = &[
 pub(crate) const DEFAULT_SEMANTIC_NODE_BUDGET: usize = 300;
 const NEAR_VIEWPORT_MARGIN: f64 = 1_000.0;
 const MAX_SEMANTIC_TEXT_CHARS: usize = 1_000;
+/// Listas longas (países, línguas) cortam-se aqui: o browser_select aceita
+/// qualquer rótulo ou valor, listado ou não.
+pub(crate) const MAX_LISTED_SELECT_OPTIONS: usize = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Rect {
@@ -82,6 +85,7 @@ struct DomMeta {
     css_hidden: bool,
     parent_backend_node_id: Option<i64>,
     frame_id: Option<String>,
+    option_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +127,14 @@ pub(crate) struct SemanticNode {
     pub(crate) visibility: BrowserVisibility,
     pub(crate) actions: Vec<BrowserActionKind>,
     pub(crate) document_order: usize,
+    /// O menu de um <select> nativo abre fora da página: só aqui se vê o que tem.
+    pub(crate) select_options: Option<SelectOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SelectOptions {
+    pub(crate) labels: Vec<String>,
+    pub(crate) total: usize,
 }
 
 impl SemanticNode {
@@ -311,6 +323,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
             index.nodes.insert(
                 backend,
                 DomMeta {
+                    option_text: (tag == "option").then(|| descendant_text(node)),
                     tag,
                     attrs,
                     order: *order,
@@ -558,6 +571,7 @@ pub(crate) fn compose_accessibility_tree(
             visibility,
             actions,
             document_order,
+            select_options: backend_node_id.and_then(|backend| select_options(dom, backend)),
         });
     }
 
@@ -700,8 +714,62 @@ fn supplement_dom_actions(
             visibility,
             actions,
             document_order: meta.order,
+            select_options: select_options(dom, backend_node_id),
         });
     }
+}
+
+fn descendant_text(node: &Value) -> String {
+    fn collect(node: &Value, out: &mut String) {
+        if node.get("nodeType").and_then(Value::as_i64) == Some(3) {
+            out.push_str(node.get("nodeValue").and_then(Value::as_str).unwrap_or(""));
+        }
+        for child in node
+            .get("children")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            collect(child, out);
+        }
+    }
+    let mut text = String::new();
+    collect(node, &mut text);
+    text
+}
+
+fn select_options(dom: &DomIndex, select_backend: i64) -> Option<SelectOptions> {
+    if dom.nodes.get(&select_backend)?.tag != "select" {
+        return None;
+    }
+    let belongs = |meta: &DomMeta| {
+        meta.parent_backend_node_id.is_some_and(|parent| {
+            parent == select_backend
+                || dom.nodes.get(&parent).is_some_and(|group| {
+                    group.tag == "optgroup" && group.parent_backend_node_id == Some(select_backend)
+                })
+        })
+    };
+    let mut options = dom
+        .nodes
+        .values()
+        .filter(|meta| meta.tag == "option" && belongs(meta))
+        .collect::<Vec<_>>();
+    options.sort_by_key(|meta| meta.order);
+    let total = options.len();
+    let labels = options
+        .into_iter()
+        .take(MAX_LISTED_SELECT_OPTIONS)
+        .map(|meta| {
+            meta.attrs
+                .get("label")
+                .cloned()
+                .or_else(|| meta.option_text.clone())
+                .and_then(clean_semantic_text)
+                .unwrap_or_default()
+        })
+        .collect();
+    Some(SelectOptions { labels, total })
 }
 
 fn attributes(node: &Value) -> HashMap<String, String> {
@@ -814,6 +882,11 @@ fn action_kinds(
         actions.push(BrowserActionKind::Click);
     }
     let tag = dom.map(|meta| meta.tag.as_str()).unwrap_or("");
+    // Um clique não escolhe num <select> nativo (o menu abre fora da página);
+    // browser_select escolhe a opção pela própria página.
+    if matches!(role, "combobox" | "listbox" | "option") || matches!(tag, "select" | "option") {
+        actions.push(BrowserActionKind::Select);
+    }
     let editable = states.get("editable").is_some_and(|value| {
         value.as_bool() == Some(true) || value.as_str().is_some_and(|value| value != "false")
     }) || dom.is_some_and(|meta| {
@@ -1175,11 +1248,73 @@ mod tests {
             css_hidden: false,
             parent_backend_node_id: None,
             frame_id: None,
+            option_text: None,
         };
         assert_eq!(
             action_kinds("textbox", Some(&dom), &BTreeMap::new(), None),
             vec![BrowserActionKind::Upload]
         );
+    }
+
+    #[test]
+    fn native_selects_list_their_options_and_declare_select() {
+        let option = |backend: i64, label: &str| {
+            json!({"nodeType": 1, "nodeName": "OPTION", "backendNodeId": backend,
+                   "children": [{"nodeType": 3, "nodeName": "#text", "nodeValue": label}]})
+        };
+        let mut countries = vec![option(11, "  Selecionar ")];
+        countries.push(
+            json!({"nodeType": 1, "nodeName": "OPTGROUP", "backendNodeId": 12,
+            "children": [option(13, "Portugal"), option(14, "Países Baixos")]}),
+        );
+        for index in 0..40 {
+            countries.push(option(100 + index, &format!("País {index}")));
+        }
+        let dom = build_dom_index(&json!({
+            "nodeType": 9,
+            "children": [
+                {"nodeType": 1, "nodeName": "SELECT", "backendNodeId": 10, "children": countries},
+                {"nodeType": 1, "nodeName": "DIV", "backendNodeId": 20,
+                 "attributes": ["role", "combobox"]}
+            ]
+        }));
+        let ax = json!({"nodes": [
+            {"nodeId": "root", "ignored": false, "role": {"value": "RootWebArea"},
+             "childIds": ["country", "custom"]},
+            {"nodeId": "country", "parentId": "root", "ignored": false,
+             "backendDOMNodeId": 10, "role": {"value": "combobox"},
+             "name": {"value": "País ou região"}, "value": {"value": "Selecionar"}},
+            {"nodeId": "custom", "parentId": "root", "ignored": false,
+             "backendDOMNodeId": 20, "role": {"value": "combobox"},
+             "name": {"value": "Idioma"}}
+        ]});
+        let document = compose_accessibility_tree(
+            &ax,
+            &dom,
+            &LayoutIndex::default(),
+            &Viewport::default(),
+            frame(),
+        );
+        let country = document
+            .nodes
+            .iter()
+            .find(|node| node.backend_node_id == Some(10))
+            .unwrap();
+        let options = country.select_options.as_ref().unwrap();
+        assert_eq!(options.total, 43);
+        assert_eq!(options.labels.len(), MAX_LISTED_SELECT_OPTIONS);
+        assert_eq!(
+            &options.labels[..3],
+            &["Selecionar", "Portugal", "Países Baixos"]
+        );
+        assert!(country.actions.contains(&BrowserActionKind::Select));
+        let custom = document
+            .nodes
+            .iter()
+            .find(|node| node.backend_node_id == Some(20))
+            .unwrap();
+        assert!(custom.select_options.is_none());
+        assert!(custom.actions.contains(&BrowserActionKind::Select));
     }
     use crate::browser::store::FrameRef;
 

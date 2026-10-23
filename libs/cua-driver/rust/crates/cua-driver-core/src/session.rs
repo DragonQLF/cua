@@ -1810,6 +1810,7 @@ mod tests {
             "browser_set_input_files",
             "browser_download",
             "browser_pointer",
+            "browser_select",
         ] {
             let operation = crate::server::tool_operation(tool_name, Some(&args));
             assert!(

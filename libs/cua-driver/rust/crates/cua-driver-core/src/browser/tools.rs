@@ -22,6 +22,7 @@ use super::file_chooser::{deliver_with_chooser_contained, ChooserInterception, C
 use super::platform::{BrowserVisualActionKind, PrepareProfile, PrepareRequest, PrepareStrategy};
 use super::pointer::BrowserPointerTool;
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
+use super::select::BrowserSelectTool;
 use super::session_schema as schema_session;
 use super::store::BrowserActionKind;
 use super::types::BindingQuality;
@@ -39,6 +40,7 @@ pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRe
     registry.register(Box::new(BrowserSetInputFilesTool::new(engine.clone())));
     registry.register(Box::new(BrowserDownloadTool::new(engine.clone())));
     registry.register(Box::new(BrowserPointerTool::new(engine.clone())));
+    registry.register(Box::new(BrowserSelectTool::new(engine.clone())));
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -220,7 +222,7 @@ pub(crate) async fn browser_protected_resource_scope(
 }
 
 fn semantic_ref_value(listed: &super::engine::SemanticListedRef) -> Value {
-    json!({
+    let mut value = json!({
         "ref": listed.external,
         "role": listed.node.role,
         "name": listed.node.name,
@@ -229,7 +231,14 @@ fn semantic_ref_value(listed: &super::engine::SemanticListedRef) -> Value {
         "actions": listed.node.actions.iter().map(|action| action.as_str()).collect::<Vec<_>>(),
         "frame": listed.node.frame.kind.as_str(),
         "visibility": listed.node.visibility.as_str(),
-    })
+    });
+    if let Some(options) = &listed.node.select_options {
+        value["options"] = json!(options.labels);
+        if options.total > options.labels.len() {
+            value["options_total"] = json!(options.total);
+        }
+    }
+    value
 }
 
 fn with_tab_screenshot(mut result: ToolResult, screenshot: BrowserTabScreenshot) -> ToolResult {
@@ -1342,7 +1351,7 @@ impl Tool for BrowserClickTool {
 }
 
 /// Center of the content quad from a `DOM.getBoxModel` result.
-fn quad_center(box_model: &Value) -> Option<(f64, f64)> {
+pub(crate) fn quad_center(box_model: &Value) -> Option<(f64, f64)> {
     let quad = box_model.get("model")?.get("content")?.as_array()?;
     if quad.len() < 8 {
         return None;
@@ -3073,6 +3082,10 @@ mod tests {
                 BrowserPointerTool::new(e.clone()).def().clone(),
                 "browser_pointer",
             ),
+            (
+                BrowserSelectTool::new(e.clone()).def().clone(),
+                "browser_select",
+            ),
         ] {
             assert_eq!(def.name, name);
             assert!(!def.read_only, "{name} is a mutation");
@@ -3089,6 +3102,7 @@ mod tests {
             BrowserSetInputFilesTool::new(e.clone()).def().clone(),
             BrowserDownloadTool::new(e.clone()).def().clone(),
             BrowserPointerTool::new(e.clone()).def().clone(),
+            BrowserSelectTool::new(e.clone()).def().clone(),
         ] {
             assert!(def.open_world, "{} can affect open-world state", def.name);
         }
@@ -3112,7 +3126,8 @@ mod tests {
                 "browser_dialog",
                 "browser_set_input_files",
                 "browser_download",
-                "browser_pointer"
+                "browser_pointer",
+                "browser_select"
             ]
         );
     }

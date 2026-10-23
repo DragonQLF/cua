@@ -423,6 +423,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "browser_set_input_files" => &["browser.input.files"],
         "browser_download" => &["browser.download"],
         "browser_pointer" => &["browser.input.pointer"],
+        "browser_select" => &["browser.input.select"],
 
         // ── driver self-service ──────────────────────────────────────
         "check_for_update" => &["driver.update_check"],
@@ -5914,6 +5915,7 @@ mod capability_tests {
         "browser_set_input_files",
         "browser_download",
         "browser_pointer",
+        "browser_select",
         "history_status",
         "history_query",
         "parse_visual_regions",
@@ -6004,6 +6006,7 @@ mod capability_tests {
         "browser.dialog",
         "browser.download",
         "browser.input.pointer",
+        "browser.input.select",
         // driver self
         "driver.update_check",
         "driver.probe",

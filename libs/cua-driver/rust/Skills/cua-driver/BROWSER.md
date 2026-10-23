@@ -25,6 +25,7 @@ get_browser_state(pid, window_id, session?)               # bind
 get_browser_state(target_id, tab_id, session?,
                   snapshot_format=semantic_v2)            # snapshot
 browser_navigate / browser_click / browser_type / browser_pointer
+browser_select
 browser_dialog / browser_set_input_files / browser_download
 get_browser_state(target_id, tab_id, session?,
                   snapshot_format=semantic_v2)            # verify and refresh refs
@@ -415,6 +416,34 @@ browser_pointer
     "action":"scroll","input_route":"dom_event","delta_y":240,
     "session":"browser-run-1"}'
 ```
+
+### Dropdowns
+
+Choose dropdown options with `browser_select`, never with clicks or keys. A
+native `<select>` draws its menu outside the page (an `NSMenu` on macOS), so
+`browser_click`, `press_key`, and coordinates cannot operate it, and a
+synthetic click on an `option` ref chooses nothing. `browser_select` sets the
+option through the page and fires the `input` and `change` events a person's
+choice would, so React, Vue, and Angular forms see it. A custom ARIA combobox
+or listbox is opened in the page and its matching `role=option` is clicked;
+a searchable combobox input gets the option typed first. Everything stays in
+the background.
+
+A semantic snapshot lists a native select's `options` on its ref (the first
+30, with `options_total` when there are more). `option` matches a label, then
+a value: exact, ignoring case and extra spaces, then a unique partial match.
+No match returns the options there are; several partial matches ask for the
+exact label. The ref may also be an `option` ref, without `option`.
+
+```text
+browser_select
+  '{"target_id":"<target>","tab_id":"<tab>","ref":"p6:3",
+    "option":"Portugal","session":"browser-run-1"}'
+```
+
+A native select reports `effect:"verified"`, or refuses when the page put the
+previous choice back. For an ARIA dropdown, `effect:"unverifiable"` means the
+page did not show the option as chosen; snapshot again before going on.
 
 ### JavaScript dialogs
 

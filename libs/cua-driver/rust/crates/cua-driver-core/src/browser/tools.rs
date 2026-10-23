@@ -1424,7 +1424,7 @@ const SELECT_ALL_IN_ELEMENT: &str = "function() { \
 /// to *set* a field that already holds text — a caller who tries ends up with
 /// the old and the new value concatenated. Both delivery paths replace the
 /// current selection, so selecting everything first turns "insert" into "set".
-async fn select_all_in_element(
+pub(crate) async fn select_all_in_element(
     conn: &CdpConnection,
     cdp: &str,
     object_id: &str,
@@ -1454,7 +1454,7 @@ async fn select_all_in_element(
 /// Selection alone is not durable in a fully occluded window: without focus
 /// emulation Chromium can accept `Input.insertText` while discarding the
 /// selection, silently turning replacement back into append.
-async fn enter_focus_emulation(
+pub(crate) async fn enter_focus_emulation(
     conn: &CdpConnection,
     cdp: &str,
     backend_node_id: i64,
@@ -2835,7 +2835,7 @@ async fn gesture_click(conn: &CdpConnection, cdp: &str, object_id: &str) -> anyh
 }
 
 /// The trusted click `browser_click` delivers, at the node's center.
-async fn trusted_click_on_node(
+pub(crate) async fn trusted_click_on_node(
     conn: &CdpConnection,
     cdp: &str,
     backend_node_id: i64,

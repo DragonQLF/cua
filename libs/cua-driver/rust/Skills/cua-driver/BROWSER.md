@@ -424,10 +424,21 @@ native `<select>` draws its menu outside the page (an `NSMenu` on macOS), so
 `browser_click`, `press_key`, and coordinates cannot operate it, and a
 synthetic click on an `option` ref chooses nothing. `browser_select` sets the
 option through the page and fires the `input` and `change` events a person's
-choice would, so React, Vue, and Angular forms see it. A custom ARIA combobox
-or listbox is opened in the page and its matching `role=option` is clicked;
-a searchable combobox input gets the option typed first. Everything stays in
-the background.
+choice would, so React, Vue, and Angular forms see it.
+
+Any other dropdown (an ARIA combobox, listbox, or menu button, also inside
+shadow DOM or rendered in a portal elsewhere in the page) is operated through
+the accessibility tree, as Chrome DevTools does: the trigger is clicked at its
+box, the opened list is read from the next accessibility tree (`option`,
+`menuitem`, `menuitemradio`, `menuitemcheckbox`, `treeitem`, or a `gridcell`
+in a listbox or grid), and the option with the matching accessible name is
+clicked. A searchable combobox gets the text typed with `Input.insertText`
+first; a long virtualized list is scrolled and read again until the option
+shows. The trigger is then checked for the choice. Clicks use trusted CDP
+input only where it keeps the browser window in the background; where it
+would activate the window (a standalone browser on macOS or Linux) they are
+synthetic in-page pointer events unless `delivery_mode:"foreground"` accepts
+the activation. The result says which in `click_route`.
 
 A semantic snapshot lists a native select's `options` on its ref (the first
 30, with `options_total` when there are more). `option` matches a label, then
@@ -442,8 +453,8 @@ browser_select
 ```
 
 A native select reports `effect:"verified"`, or refuses when the page put the
-previous choice back. For an ARIA dropdown, `effect:"unverifiable"` means the
-page did not show the option as chosen; snapshot again before going on.
+previous choice back. For any other dropdown, `effect:"unverifiable"` means
+the trigger did not show the option as chosen; snapshot again before going on.
 
 ### JavaScript dialogs
 

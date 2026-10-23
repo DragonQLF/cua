@@ -95,7 +95,9 @@ struct FixtureState {
     /// the page answers to the native and ARIA select functions.
     select_page: bool,
     native_select_reply: Value,
-    aria_select_reply: Value,
+    /// Árvores AX de um dropdown feito à mão, uma por clique entregue.
+    aria_trees: Vec<Value>,
+    aria_stage: usize,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -136,7 +138,8 @@ impl Default for FixtureState {
             download_path: None,
             select_page: false,
             native_select_reply: Value::Null,
-            aria_select_reply: Value::Null,
+            aria_trees: Vec::new(),
+            aria_stage: 0,
             calls: Vec::new(),
         }
     }
@@ -558,6 +561,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             }
             "DOM.setFileInputFiles" | "Input.dispatchDragEvent" => MockReply::ok(json!({})),
             "Input.dispatchMouseEvent" if call.params["type"] == "mouseReleased" => {
+                st.aria_stage += 1;
                 let events = request_chooser(&mut st);
                 MockReply::ok(json!({})).with_events(events)
             }
@@ -566,6 +570,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 MockReply::ok(json!({}))
             }
             "Runtime.callFunctionOn" if call.params["userGesture"] == true => {
+                st.aria_stage += 1;
                 let mut events = request_chooser(&mut st);
                 if let (Some((name, bytes)), Some(path)) =
                     (st.download_on_activation, st.download_path.clone())
@@ -684,6 +689,10 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 }
             })),
             "DOM.getDocument" if is_tab && st.select_page => MockReply::ok(select_document()),
+            "Accessibility.getFullAXTree" if is_tab && !st.aria_trees.is_empty() => {
+                let stage = st.aria_stage.min(st.aria_trees.len() - 1);
+                MockReply::ok(st.aria_trees[stage].clone())
+            }
             "Accessibility.getFullAXTree" if is_tab && st.select_page => {
                 MockReply::ok(json!({"nodes": [
                     {"nodeId": "root", "ignored": false, "role": {"value": "RootWebArea"},
@@ -704,15 +713,6 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             {
                 MockReply::ok(
                     json!({ "result": { "type": "object", "value": st.native_select_reply.clone() } }),
-                )
-            }
-            "Runtime.callFunctionOn"
-                if call.params["functionDeclaration"]
-                    .as_str()
-                    .is_some_and(|f| f.contains("const findOptions")) =>
-            {
-                MockReply::ok(
-                    json!({ "result": { "type": "object", "value": st.aria_select_reply.clone() } }),
                 )
             }
             "DOM.getDocument" if is_tab => {
@@ -867,7 +867,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 let known = if is_oopif {
                     backend == 100
                 } else {
-                    [10, 20, 21, 30].contains(&backend)
+                    [10, 20, 21, 30].contains(&backend) || st.select_page
                 };
                 if known {
                     let (x, y) = ((backend * 10) as f64, (backend * 10) as f64);
@@ -3364,13 +3364,50 @@ async fn select_without_a_match_returns_the_options_there_are() {
     assert_eq!(s["refusal"]["detail"]["options_total"], 3);
 }
 
-#[tokio::test]
-async fn select_falls_back_to_the_aria_listbox_when_there_is_no_native_select() {
-    let f = fixture_with(|st| {
-        st.select_page = true;
-        st.native_select_reply = json!({ "kind": "none" });
-        st.aria_select_reply = json!({ "kind": "aria", "label": "English (UK)", "verified": true });
-    })
+/// Um dropdown feito à mão, como a árvore AX o mostra: fechado, aberto com
+/// a lista que controla, e com a escolha feita.
+fn aria_dropdown_trees() -> Vec<Value> {
+    let trigger = |value: &str, expanded: bool, controls: bool| {
+        let mut properties = vec![
+            json!({"name": "expanded", "value": {"type": "boolean", "value": expanded}}),
+            json!({"name": "hasPopup", "value": {"type": "token", "value": "listbox"}}),
+        ];
+        if controls {
+            properties.push(
+                json!({"name": "controls", "value": {"type": "idrefList", "value": "",
+                "relatedNodes": [{"backendDOMNodeId": 60}]}}),
+            );
+        }
+        json!({"nodeId": "country", "parentId": "root", "ignored": false, "backendDOMNodeId": 40,
+               "role": {"value": "combobox"}, "name": {"value": "País ou região"},
+               "value": {"value": value}, "properties": properties})
+    };
+    let root = |children: &[&str]| json!({"nodeId": "root", "ignored": false, "role": {"value": "RootWebArea"}, "childIds": children});
+    vec![
+        json!({"nodes": [root(&["country"]), trigger("Selecionar", false, false)]}),
+        json!({"nodes": [
+            root(&["country", "list"]),
+            trigger("Selecionar", true, true),
+            {"nodeId": "list", "parentId": "root", "ignored": false, "backendDOMNodeId": 60,
+             "role": {"value": "listbox"}, "childIds": ["us", "uk"]},
+            {"nodeId": "us", "parentId": "list", "ignored": false, "backendDOMNodeId": 61,
+             "role": {"value": "option"}, "name": {"value": "English (US)"}},
+            {"nodeId": "uk", "parentId": "list", "ignored": false, "backendDOMNodeId": 62,
+             "role": {"value": "option"}, "name": {"value": "English (UK)"}}
+        ]}),
+        json!({"nodes": [root(&["country"]), trigger("English (UK)", false, false)]}),
+    ]
+}
+
+async fn choose_in_aria_dropdown(trusted_input_limited: bool) -> (Fixture, Value) {
+    let f = fixture_with_platform(
+        |st| {
+            st.select_page = true;
+            st.native_select_reply = json!({ "kind": "none" });
+            st.aria_trees = aria_dropdown_trees();
+        },
+        trusted_input_limited,
+    )
     .await;
     let (target, tab) = bind(&f).await;
     let snap = semantic_snapshot(&f, &target, &tab).await;
@@ -3380,16 +3417,45 @@ async fn select_falls_back_to_the_aria_listbox_when_there_is_no_native_select() 
         &target,
         &tab,
         country["ref"].as_str().unwrap(),
-        "English (UK)",
+        "english (uk)",
     )
     .await;
-    let s = structured(&result);
+    let s = structured(&result).clone();
+    (f, s)
+}
+
+#[tokio::test]
+async fn custom_dropdowns_are_opened_and_chosen_through_the_accessibility_tree() {
+    let (f, s) = choose_in_aria_dropdown(false).await;
     assert_eq!(s["status"], "ok", "{s}");
-    assert_eq!(s["route"], "aria_listbox");
+    assert_eq!(s["route"], "accessibility");
+    assert_eq!(s["click_route"], "cdp_input");
+    assert_eq!(s["label"], "English (UK)");
     assert_eq!(s["effect"], "verified");
-    let calls = recorded_calls(&f, "Runtime.callFunctionOn");
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[1].1["awaitPromise"], true);
+    let clicks: Vec<Value> = recorded_calls(&f, "Input.dispatchMouseEvent")
+        .into_iter()
+        .filter(|(_, params)| params["type"] == "mousePressed")
+        .map(|(_, params)| json!([params["x"], params["y"]]))
+        .collect();
+    // O gatilho (40) e depois a opção (62), cada um no centro da sua caixa.
+    assert_eq!(clicks, vec![json!([410.0, 405.0]), json!([630.0, 625.0])]);
+    for method in ["Page.bringToFront", "Target.activateTarget"] {
+        assert!(recorded_calls(&f, method).is_empty(), "{method} was sent");
+    }
+}
+
+#[tokio::test]
+async fn custom_dropdowns_use_page_events_where_cdp_input_would_raise_the_window() {
+    let (f, s) = choose_in_aria_dropdown(true).await;
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["click_route"], "dom_events");
+    assert_eq!(s["effect"], "verified");
+    let gestures = recorded_calls(&f, "Runtime.callFunctionOn")
+        .into_iter()
+        .filter(|(_, params)| params["userGesture"] == true)
+        .map(|(_, params)| params["objectId"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(gestures, vec![json!("obj-40"), json!("obj-62")]);
     no_input_or_activation(&f);
 }
 
@@ -3409,4 +3475,188 @@ async fn select_refuses_refs_that_are_not_dropdowns_before_touching_the_page() {
         "browser_action_unavailable"
     );
     assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+}
+
+// ── Dropdowns num Chromium real (opcional) ───────────────────────────────────
+
+/// Corre contra um Chromium headless já aberto na página de dropdowns do
+/// smoke (CUA_SELECT_SMOKE_WS = o WebSocket do browser), com Input do CDP e
+/// depois com o recurso de eventos na página.
+#[tokio::test]
+#[ignore = "needs CUA_SELECT_SMOKE_WS: a headless Chromium on the dropdown fixture page"]
+async fn dropdown_fixture_in_a_real_chromium() {
+    let ws_url = std::env::var("CUA_SELECT_SMOKE_WS").expect("CUA_SELECT_SMOKE_WS");
+    let page = super::cdp_ws::CdpConnection::connect(&ws_url)
+        .await
+        .unwrap();
+    let targets = page
+        .call(None, "Target.getTargets", json!({}))
+        .await
+        .unwrap();
+    let target_id = targets["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|target| target["type"] == "page")
+        .unwrap()["targetId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let attached = page
+        .call(
+            None,
+            "Target.attachToTarget",
+            json!({ "targetId": target_id, "flatten": true }),
+        )
+        .await
+        .unwrap();
+    let page_session = attached["sessionId"].as_str().unwrap().to_owned();
+    let read = |expression: &'static str| {
+        let page = &page;
+        let page_session = page_session.clone();
+        async move {
+            page.call(
+                Some(&page_session),
+                "Runtime.evaluate",
+                json!({ "expression": expression, "returnByValue": true }),
+            )
+            .await
+            .unwrap()["result"]["value"]
+                .clone()
+        }
+    };
+    let cases: &[(&str, &str, &str, &str)] = &[
+        ("Língua", "inglês (reino unido)", "plain.value", "en-GB"),
+        (
+            "País ou região",
+            "Portugal",
+            "document.getElementById('react-country-state').textContent",
+            "PO2",
+        ),
+        (
+            "Idioma principal",
+            "Inglês (Reino Unido)",
+            "document.getElementById('lang').textContent",
+            "Inglês (Reino Unido)",
+        ),
+        (
+            "Cidade",
+            "Braga",
+            "document.getElementById('city-state').textContent",
+            "Braga",
+        ),
+        (
+            "Ordenar",
+            "Nome (A-Z)",
+            "document.getElementById('sort').textContent",
+            "Nome (A-Z)",
+        ),
+        (
+            "Fuso horário",
+            "Açores",
+            "document.getElementById('tz').textContent",
+            "Açores (AZOT)",
+        ),
+        (
+            "Cor",
+            "Verde",
+            "document.getElementById('shadow-host').shadowRoot.getElementById('t').textContent",
+            "Verde",
+        ),
+        (
+            "Produto",
+            "Artigo 873",
+            "document.getElementById('product').textContent",
+            "Artigo 873",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for limited in [false, true] {
+        page.call(Some(&page_session), "Page.reload", json!({}))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let engine = BrowserEngine::new(Arc::new(FixturePlatform {
+            ws_url: ws_url.clone(),
+            trusted_input_limited: limited,
+            managed_endpoint_visible: true,
+            process_role: BrowserProcessRole::EmbeddedApplication,
+            managed_discovery_invoked: Arc::new(AtomicBool::new(false)),
+            existing_endpoint_visible: Arc::new(AtomicBool::new(true)),
+            setup_invoked: Arc::new(AtomicBool::new(false)),
+            setup_aborted: Arc::new(AtomicBool::new(false)),
+            stall_consent: false,
+        }));
+        let bound = GetBrowserStateTool::new(engine.clone())
+            .invoke(json!({ "pid": 1, "window_id": 7, "session": SESSION }))
+            .await;
+        let bound = structured(&bound).clone();
+        assert_eq!(bound["status"], "ok", "bind: {bound}");
+        let target = bound["target_id"].as_str().unwrap().to_owned();
+        let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
+        for (name, option, check, expected) in cases {
+            let snap = GetBrowserStateTool::new(engine.clone())
+                .invoke(json!({
+                    "target_id": target, "tab_id": tab, "session": SESSION,
+                    "snapshot_format": "semantic_v2", "query": name,
+                }))
+                .await;
+            let snap = structured(&snap).clone();
+            let Some(found) = snap["refs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|entry| entry["name"] == *name || entry["value"] == *name)
+            else {
+                println!("FAIL limited={limited} {name}: no ref in {}", snap["refs"]);
+                failures.push(format!("limited={limited} {name}: no ref"));
+                continue;
+            };
+            let result = BrowserSelectTool::new(engine.clone())
+                .invoke(json!({
+                    "target_id": target, "tab_id": tab, "session": SESSION,
+                    "ref": found["ref"], "option": option,
+                }))
+                .await;
+            let s = result
+                .structured_content
+                .clone()
+                .unwrap_or_else(|| json!({ "error": format!("{:?}", result.content) }));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let shown = read(check).await;
+            let pass = s["status"] == "ok" && s["effect"] == "verified" && shown == *expected;
+            println!(
+                "{} limited={limited} {name} -> {option}: route={} click_route={} effect={} page={shown}",
+                if pass { "PASS" } else { "FAIL" },
+                s["route"], s["click_route"], s["effect"]
+            );
+            if !pass {
+                println!(
+                    "  detail: {s} actions={} role={}",
+                    found["actions"], found["role"]
+                );
+                failures.push(format!("limited={limited} {name}"));
+            }
+        }
+        let snap = GetBrowserStateTool::new(engine.clone())
+            .invoke(json!({ "target_id": target, "tab_id": tab, "session": SESSION, "snapshot_format": "semantic_v2", "query": "Açores (AZOT)" }))
+            .await;
+        let sort_ref = structured(&snap)["refs"][0]["ref"].clone();
+        let missing = BrowserSelectTool::new(engine.clone())
+            .invoke(json!({
+                "target_id": target, "tab_id": tab, "session": SESSION,
+                "ref": sort_ref, "option": "Klingon",
+            }))
+            .await;
+        let s = missing.structured_content.clone().unwrap_or_default();
+        let closed = read("document.querySelector('[aria-label=Fusos]') === null").await;
+        println!(
+            "no-match limited={limited}: {} closed={closed}",
+            s["refusal"]["message"]
+        );
+        if s["refusal"]["code"] != "browser_action_unavailable" || closed != true {
+            failures.push(format!("limited={limited} no-match: {s} closed={closed}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

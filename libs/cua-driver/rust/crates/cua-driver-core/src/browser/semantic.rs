@@ -884,7 +884,22 @@ fn action_kinds(
     let tag = dom.map(|meta| meta.tag.as_str()).unwrap_or("");
     // Um clique não escolhe num <select> nativo (o menu abre fora da página);
     // browser_select escolhe a opção pela própria página.
-    if matches!(role, "combobox" | "listbox" | "option") || matches!(tag, "select" | "option") {
+    let opens_list = states
+        .get("hasPopup")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value != "false");
+    if matches!(
+        role,
+        "combobox"
+            | "listbox"
+            | "option"
+            | "menuitem"
+            | "menuitemradio"
+            | "menuitemcheckbox"
+            | "treeitem"
+    ) || matches!(tag, "select" | "option")
+        || opens_list
+    {
         actions.push(BrowserActionKind::Select);
     }
     let editable = states.get("editable").is_some_and(|value| {
@@ -976,6 +991,7 @@ fn ax_states(node: &Value) -> BTreeMap<String, Value> {
         "expanded",
         "focused",
         "focusable",
+        "hasPopup",
         "pressed",
         "required",
         "selected",

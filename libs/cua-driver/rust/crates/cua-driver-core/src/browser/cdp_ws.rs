@@ -30,6 +30,10 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Debug, thiserror::Error)]
+#[error("CDP connect to {0} timed out")]
+pub struct CdpConnectTimedOut(pub String);
+
 /// Connection-scoped command policy. Grant-owned personal-profile sockets
 /// always use the reviewed set below; callers cannot opt out or relax it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,11 +267,14 @@ impl Drop for CdpConnection {
 
 impl CdpConnection {
     pub async fn connect(ws_url: &str) -> anyhow::Result<Self> {
+        Self::connect_within(ws_url, CONNECT_TIMEOUT).await
+    }
+
+    async fn connect_within(ws_url: &str, timeout: Duration) -> anyhow::Result<Self> {
         validate_loopback_ws_url(ws_url).map_err(|e| anyhow::anyhow!(e))?;
-        let (ws, _resp) =
-            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
-                .await
-                .map_err(|_| anyhow::anyhow!("CDP connect to {ws_url} timed out"))??;
+        let (ws, _resp) = tokio::time::timeout(timeout, tokio_tungstenite::connect_async(ws_url))
+            .await
+            .map_err(|_| anyhow::Error::new(CdpConnectTimedOut(ws_url.to_owned())))??;
         let (write, read) = ws.split();
         let demux = Arc::new(Demux {
             pending: StdMutex::new(HashMap::new()),
@@ -707,6 +714,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["echoed"]["x"], 7);
+    }
+
+    #[tokio::test]
+    async fn handshake_held_open_by_a_consent_prompt_times_out_typed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(socket);
+        });
+        let error = CdpConnection::connect_within(
+            &format!("ws://127.0.0.1:{port}/devtools/browser"),
+            Duration::from_millis(200),
+        )
+        .await
+        .err()
+        .expect("a handshake that never answers must time out");
+        assert!(
+            error.downcast_ref::<CdpConnectTimedOut>().is_some(),
+            "{error}"
+        );
+        held.abort();
     }
 
     #[tokio::test]

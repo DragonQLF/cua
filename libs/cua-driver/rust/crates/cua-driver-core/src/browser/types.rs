@@ -169,6 +169,9 @@ pub enum EndpointTransport {
     #[default]
     LegacyJsonVersion,
     EmbeddedDescendant,
+    /// The browser-level path on the only loopback listener owned by the
+    /// browser pid, used when its `DevToolsActivePort` file is unreadable.
+    OwnedLoopbackListener,
 }
 
 /// Core's authorization verdict for a bound endpoint.
@@ -354,6 +357,11 @@ mod tests {
             serde_json::to_value(EndpointTransport::DevToolsActivePort)
                 .expect("serialize endpoint transport"),
             "dev_tools_active_port"
+        );
+        assert_eq!(
+            serde_json::to_value(EndpointTransport::OwnedLoopbackListener)
+                .expect("serialize endpoint transport"),
+            "owned_loopback_listener"
         );
         assert_eq!(
             serde_json::to_value(EndpointAccessClass::ExistingProfileApproved)

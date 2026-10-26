@@ -589,26 +589,55 @@ async fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
     )))
 }
 
+const DATA_FOLDER_BLOCKED_GUIDANCE: &str = "macOS blocked reading the browser's data folder, so its remote-debugging endpoint could not be found. Give Orbit Full Disk Access (System Settings › Privacy & Security › Full Disk Access) or relaunch the browser with remote debugging enabled";
+
+#[derive(Debug)]
+enum ActivePortFile {
+    Endpoint(OwnedEndpoint),
+    Missing,
+    Blocked,
+}
+
+fn classify_active_port_read(
+    read: std::io::Result<String>,
+    user_data_dir: &std::path::Path,
+) -> Result<Result<String, ActivePortFile>, BrowserRefusal> {
+    match read {
+        Ok(text) => Ok(Ok(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Ok(Err(ActivePortFile::Blocked))
+        }
+        // Sem acesso à pasta, um ficheiro em falta não prova que o browser não o publicou.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Err(match std::fs::read_dir(user_data_dir) {
+                Err(dir_error) if dir_error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    ActivePortFile::Blocked
+                }
+                _ => ActivePortFile::Missing,
+            }))
+        }
+        Err(error) => Err(refusal(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            format!("could not read the browser's DevToolsActivePort file: {error}"),
+        )),
+    }
+}
+
 async fn active_port_endpoint(
     pid: i64,
     product: BrowserProduct,
-) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+) -> Result<ActivePortFile, BrowserRefusal> {
     // The Chrome 144+ existing-profile bridge deliberately returns 404 for
     // legacy /json discovery. Its exact browser WebSocket path is instead
     // published in the exact user-data root's DevToolsActivePort file. argv
     // comes from KERN_PROCARGS2 rather than lossy `ps` text.
     let Some(user_data_dir) = user_data_dir_for_pid(pid, product).await? else {
-        return Ok(None);
+        return Ok(ActivePortFile::Missing);
     };
-    let text = match tokio::fs::read_to_string(user_data_dir.join("DevToolsActivePort")).await {
+    let read = tokio::fs::read_to_string(user_data_dir.join("DevToolsActivePort")).await;
+    let text = match classify_active_port_read(read, &user_data_dir)? {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(refusal(
-                BrowserRefusalCode::BrowserRouteUnavailable,
-                format!("could not read the browser's DevToolsActivePort file: {error}"),
-            ))
-        }
+        Err(outcome) => return Ok(outcome),
     };
     let Some((port, path)) = parse_devtools_active_port(&text) else {
         return Err(refusal(
@@ -617,9 +646,9 @@ async fn active_port_endpoint(
         ));
     };
     if !loopback_ports_for_pid(pid).await?.contains(&port) {
-        return Ok(None);
+        return Ok(ActivePortFile::Missing);
     }
-    Ok(Some(OwnedEndpoint {
+    Ok(ActivePortFile::Endpoint(OwnedEndpoint {
         ws_url: format!("ws://127.0.0.1:{port}{path}"),
         http_port: Some(port),
         transport: EndpointTransport::DevToolsActivePort,
@@ -633,6 +662,42 @@ async fn active_port_endpoint(
             ),
         },
     }))
+}
+
+fn owned_listener_endpoint(pid: i64, port: u16, detail: &str) -> OwnedEndpoint {
+    // Em modo chrome://inspect o Chrome não serve /json/version nem valida o id do
+    // caminho do browser; o handshake fica à espera do "Allow remote debugging?".
+    OwnedEndpoint {
+        ws_url: format!("ws://127.0.0.1:{port}/devtools/browser"),
+        http_port: Some(port),
+        transport: EndpointTransport::OwnedLoopbackListener,
+        ownership: EndpointOwnershipProof {
+            method: EndpointOwnershipMethod::ListeningSocketPid,
+            owner_pid: pid,
+            listener_pid: None,
+            detail: Some(detail.to_owned()),
+        },
+    }
+}
+
+fn blocked_file_listener_endpoint(
+    pid: i64,
+    ports: &[u16],
+) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+    match ports {
+        [] => Ok(None),
+        [port] => Ok(Some(owned_listener_endpoint(
+            pid,
+            *port,
+            "only lsof loopback listener owned by the browser; DevToolsActivePort unreadable",
+        ))),
+        _ => Err(refusal(
+            BrowserRefusalCode::BrowserBindingAmbiguous,
+            format!(
+                "the browser owns several loopback listeners and none is identifiable without its DevToolsActivePort file. {DATA_FOLDER_BLOCKED_GUIDANCE}"
+            ),
+        )),
+    }
 }
 
 async fn browser_websocket_url(port: u16) -> Option<String> {
@@ -948,9 +1013,11 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
         let classification = self.classify_browser(pid).await?;
-        if let Some(endpoint) = active_port_endpoint(pid, classification.product_kind).await? {
-            return Ok(Some(endpoint));
-        }
+        let file_blocked = match active_port_endpoint(pid, classification.product_kind).await? {
+            ActivePortFile::Endpoint(endpoint) => return Ok(Some(endpoint)),
+            ActivePortFile::Missing => false,
+            ActivePortFile::Blocked => true,
+        };
         let ports = loopback_ports_for_pid(pid).await?;
         let mut discovered = Vec::new();
         for port in &ports {
@@ -978,6 +1045,9 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 "multiple browser-level DevTools endpoints are owned by the approved process",
             ));
         }
+        if file_blocked {
+            return blocked_file_listener_endpoint(pid, &ports);
+        }
         // A bare listener is not enough to identify DevTools before approval:
         // Chromium can own unrelated loopback services. The setup path below
         // correlates a listener with the exact checkbox transition and the
@@ -1000,14 +1070,26 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             return Ok(None);
         }
         let classification = self.classify_browser(pid).await?;
-        if let Some(endpoint) = active_port_endpoint(pid, classification.product_kind).await? {
-            if endpoint.ws_url != expected_ws_url {
-                return Err(refusal(
-                    BrowserRefusalCode::BrowserEndpointOwnerMismatch,
-                    "the browser's exact DevTools endpoint changed after approval",
-                ));
+        match active_port_endpoint(pid, classification.product_kind).await? {
+            ActivePortFile::Endpoint(endpoint) => {
+                if endpoint.ws_url != expected_ws_url {
+                    return Err(refusal(
+                        BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                        "the browser's exact DevTools endpoint changed after approval",
+                    ));
+                }
+                return Ok(Some(endpoint));
             }
-            return Ok(Some(endpoint));
+            ActivePortFile::Blocked => {
+                let mut endpoint = owned_listener_endpoint(
+                    pid,
+                    port,
+                    "lsof owner of exact approved endpoint; DevToolsActivePort unreadable",
+                );
+                endpoint.ws_url = expected_ws_url.to_owned();
+                return Ok(Some(endpoint));
+            }
+            ActivePortFile::Missing => {}
         }
         Ok(Some(OwnedEndpoint {
             ws_url: expected_ws_url.to_owned(),
@@ -1076,10 +1158,12 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         let injected_global_input = handle.injected_global_input;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut file_blocked = false;
         let endpoint_result = loop {
             match active_port_endpoint(request.pid, request.browser).await {
-                Ok(Some(endpoint)) => break Ok(endpoint),
-                Ok(None) => {}
+                Ok(ActivePortFile::Endpoint(endpoint)) => break Ok(endpoint),
+                Ok(ActivePortFile::Missing) => {}
+                Ok(ActivePortFile::Blocked) => file_blocked = true,
                 Err(error) => break Err(error),
             }
             let ports = match loopback_ports_for_pid(request.pid).await {
@@ -1089,7 +1173,12 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             let mut endpoints = Vec::new();
             for port in &ports {
                 if let Some(ws_url) = browser_websocket_url(*port).await {
-                    endpoints.push((*port, ws_url, "lsof owner plus /json/version"));
+                    endpoints.push((
+                        *port,
+                        ws_url,
+                        EndpointTransport::LegacyJsonVersion,
+                        "lsof owner plus /json/version",
+                    ));
                 }
             }
             if endpoints.is_empty() {
@@ -1102,6 +1191,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                     endpoints.push((
                         *port,
                         format!("ws://127.0.0.1:{port}/devtools/browser"),
+                        EndpointTransport::OwnedLoopbackListener,
                         "new PID-owned listener correlated with exact approved setup",
                     ));
                 } else if correlated.len() > 1 {
@@ -1115,11 +1205,11 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 }
             }
             match endpoints.as_slice() {
-                [(port, ws_url, detail)] => {
+                [(port, ws_url, transport, detail)] => {
                     break Ok(OwnedEndpoint {
                         ws_url: ws_url.clone(),
                         http_port: Some(*port),
-                        transport: EndpointTransport::LegacyJsonVersion,
+                        transport: *transport,
                         ownership: EndpointOwnershipProof {
                             method: EndpointOwnershipMethod::ListeningSocketPid,
                             owner_pid: request.pid,
@@ -1130,6 +1220,12 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 }
                 [] if std::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                [] if file_blocked => {
+                    break Err(refusal(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        DATA_FOLDER_BLOCKED_GUIDANCE,
+                    ))
                 }
                 [] => {
                     break Err(refusal(
@@ -1316,6 +1412,114 @@ impl BrowserPlatform for MacOsBrowserPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn unreadable_active_port_file_is_classified_as_blocked() {
+        let profile = tempfile::tempdir().unwrap();
+        let file = profile.path().join("DevToolsActivePort");
+        std::fs::write(&file, "9222\n/devtools/browser/abc\n").unwrap();
+        set_mode(&file, 0o000);
+        let read = std::fs::read_to_string(&file);
+        set_mode(&file, 0o600);
+        assert_eq!(
+            read.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(matches!(
+            classify_active_port_read(read, profile.path()),
+            Ok(Err(ActivePortFile::Blocked))
+        ));
+    }
+
+    #[test]
+    fn missing_file_in_a_readable_folder_still_means_missing() {
+        let profile = tempfile::tempdir().unwrap();
+        let read = std::fs::read_to_string(profile.path().join("DevToolsActivePort"));
+        assert!(matches!(
+            classify_active_port_read(read, profile.path()),
+            Ok(Err(ActivePortFile::Missing))
+        ));
+    }
+
+    #[test]
+    fn missing_file_in_an_unreadable_folder_is_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("Chrome");
+        std::fs::create_dir(&profile).unwrap();
+        set_mode(&profile, 0o000);
+        let read = std::fs::read_to_string(profile.join("DevToolsActivePort"));
+        let classified = classify_active_port_read(read, &profile);
+        set_mode(&profile, 0o700);
+        assert!(matches!(classified, Ok(Err(ActivePortFile::Blocked))));
+    }
+
+    #[test]
+    fn other_active_port_read_errors_still_refuse() {
+        let profile = tempfile::tempdir().unwrap();
+        let read = std::fs::read_to_string(profile.path());
+        let refused = classify_active_port_read(read, profile.path()).unwrap_err();
+        assert_eq!(refused.code, BrowserRefusalCode::BrowserRouteUnavailable);
+        assert!(
+            refused.message.contains("DevToolsActivePort"),
+            "{}",
+            refused.message
+        );
+    }
+
+    #[test]
+    fn readable_active_port_file_passes_through() {
+        assert!(matches!(
+            classify_active_port_read(Ok("1\n/x\n".to_owned()), std::path::Path::new("/")),
+            Ok(Ok(text)) if text == "1\n/x\n"
+        ));
+    }
+
+    #[test]
+    fn blocked_file_uses_the_only_listener_owned_by_the_browser() {
+        assert!(blocked_file_listener_endpoint(42, &[]).unwrap().is_none());
+
+        let endpoint = blocked_file_listener_endpoint(42, &[51823])
+            .unwrap()
+            .expect("one owned listener");
+        assert_eq!(endpoint.ws_url, "ws://127.0.0.1:51823/devtools/browser");
+        assert_eq!(endpoint.http_port, Some(51823));
+        assert_eq!(endpoint.transport, EndpointTransport::OwnedLoopbackListener);
+        assert_eq!(
+            endpoint.ownership.method,
+            EndpointOwnershipMethod::ListeningSocketPid
+        );
+        assert_eq!(endpoint.ownership.owner_pid, 42);
+    }
+
+    #[test]
+    fn blocked_file_with_several_listeners_refuses_with_full_disk_access_guidance() {
+        let refused = blocked_file_listener_endpoint(42, &[51823, 51824]).unwrap_err();
+        assert_eq!(refused.code, BrowserRefusalCode::BrowserBindingAmbiguous);
+        assert!(
+            refused.message.contains("Full Disk Access"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused
+                .message
+                .contains("System Settings › Privacy & Security › Full Disk Access"),
+            "{}",
+            refused.message
+        );
+        assert!(
+            refused
+                .message
+                .contains("relaunch the browser with remote debugging"),
+            "{}",
+            refused.message
+        );
+    }
 
     fn consent_surface(window_id: u32) -> ConsentSurfaceEvidence {
         ConsentSurfaceEvidence {

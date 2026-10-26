@@ -115,6 +115,30 @@ where
     }
 }
 
+fn unclaimed_socket_refusal(error: &anyhow::Error, product: Option<&str>) -> BrowserRefusal {
+    if error
+        .downcast_ref::<super::cdp_ws::CdpConnectTimedOut>()
+        .is_none()
+    {
+        return refusal(
+            BrowserRefusalCode::BrowserReconnectExhausted,
+            "the approved browser socket could not be claimed",
+        );
+    }
+    // Um handshake pendurado é o browser à espera do "Allow remote debugging?";
+    // só a pessoa pode responder, por isso devolvemos o pedido em vez de esperar.
+    let (subject, object) = match product {
+        Some(name) => (name.to_owned(), name.to_owned()),
+        None => ("The browser".to_owned(), "the browser".to_owned()),
+    };
+    refusal(
+        BrowserRefusalCode::BrowserConsentRequired,
+        format!(
+            "{subject} is asking you to allow remote debugging — click Allow in {object}, then try again"
+        ),
+    )
+}
+
 fn with_setup_side_effects(
     mut error: BrowserRefusal,
     setup: &ExistingProfileSetupOutcome,
@@ -1218,7 +1242,7 @@ impl BrowserEngine {
                 }
             };
         let displayed_consent_prompt = displayed_consent_prompt || fresh_consent_prompt;
-        if let Err(_final_claim_error) = claimed {
+        if let Err(final_claim_error) = claimed {
             self.revoke_existing_profile_grant(
                 &request.session,
                 request.transport_session.as_deref(),
@@ -1226,14 +1250,11 @@ impl BrowserEngine {
             )
             .await;
             let error = with_prepare_side_effects(
-                refusal(
-                    BrowserRefusalCode::BrowserReconnectExhausted,
-                    "the approved browser socket could not be claimed",
-                )
-                .with_detail(serde_json::json!({
-                    "retried_after_consent": initial_claim_error.is_some(),
-                    "fresh_claim_failed": initial_claim_error.is_some(),
-                })),
+                unclaimed_socket_refusal(&final_claim_error, classification.product.as_deref())
+                    .with_detail(serde_json::json!({
+                        "retried_after_consent": initial_claim_error.is_some(),
+                        "fresh_claim_failed": initial_claim_error.is_some(),
+                    })),
                 &setup,
                 displayed_consent_prompt,
             );
@@ -1459,6 +1480,38 @@ mod tests {
             "pre-consent handshake rejected"
         );
         assert!(!fresh_displayed);
+    }
+
+    #[test]
+    fn pending_consent_handshake_asks_the_person_to_click_allow() {
+        let timed_out = anyhow::Error::new(super::super::cdp_ws::CdpConnectTimedOut(
+            "ws://127.0.0.1:9/devtools/browser".to_owned(),
+        ));
+        let refused = unclaimed_socket_refusal(&timed_out, Some("Google Chrome"));
+        assert_eq!(refused.code, BrowserRefusalCode::BrowserConsentRequired);
+        assert_eq!(
+            refused.message,
+            "Google Chrome is asking you to allow remote debugging — click Allow in Google Chrome, then try again"
+        );
+        let unnamed = unclaimed_socket_refusal(&timed_out, None);
+        assert!(
+            unnamed.message.starts_with("The browser is asking"),
+            "{}",
+            unnamed.message
+        );
+    }
+
+    #[test]
+    fn other_claim_failures_keep_the_reconnect_refusal() {
+        let refused = unclaimed_socket_refusal(
+            &anyhow::anyhow!("connection refused"),
+            Some("Google Chrome"),
+        );
+        assert_eq!(refused.code, BrowserRefusalCode::BrowserReconnectExhausted);
+        assert_eq!(
+            refused.message,
+            "the approved browser socket could not be claimed"
+        );
     }
 
     #[tokio::test]
